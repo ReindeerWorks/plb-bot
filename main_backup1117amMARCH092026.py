@@ -4,7 +4,6 @@ from supabase import create_client
 from twilio.twiml.messaging_response import MessagingResponse
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from typing import Optional
 import os
 import html
 import re
@@ -21,7 +20,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # -------------------------
-# Constants
+# Helpers
 # -------------------------
 
 VALID_OWNERS = {
@@ -38,10 +37,10 @@ VALID_CATEGORIES = {
     "daily": "daily",
     "a": "action",
     "action": "action",
-    "lt": "long_term",
     "l": "long_term",
+    "long": "long_term",
     "long_term": "long_term",
-    "longterm": "long_term",
+    "lt": "long_term",
 }
 
 DISPLAY_OWNER = {
@@ -52,15 +51,11 @@ DISPLAY_OWNER = {
 DISPLAY_CATEGORY = {
     "daily": "Daily",
     "action": "Action Items",
-    "long_term": "LT",
+    "long_term": "Long Term",
 }
 
 SECTION_ORDER = ["daily", "action", "long_term"]
 
-
-# -------------------------
-# Helpers
-# -------------------------
 
 def twiml(message: str) -> HTMLResponse:
     resp = MessagingResponse()
@@ -80,12 +75,7 @@ def escape_text(text: str) -> str:
     return html.escape(text or "")
 
 
-def format_task_line(task: dict, show_priority: bool = True) -> str:
-    flame = "🔥 " if task.get("priority") and show_priority else ""
-    return f"{flame}{task['task']} [Task ID: {task['id']}]"
-
-
-def get_tasks(owner: str, status: str = "open") -> list:
+def get_tasks(owner: str, status: str = "open"):
     response = (
         supabase.table("tasks")
         .select("*")
@@ -93,11 +83,10 @@ def get_tasks(owner: str, status: str = "open") -> list:
         .eq("status", status)
         .execute()
     )
-
     tasks = response.data or []
     tasks.sort(
         key=lambda t: (
-            0 if t.get("priority") and t.get("category") == "action" else 1,
+            0 if t.get("priority") else 1,
             SECTION_ORDER.index(t["category"]) if t.get("category") in SECTION_ORDER else 999,
             t.get("created_at") or "",
             t.get("id") or 0,
@@ -106,16 +95,63 @@ def get_tasks(owner: str, status: str = "open") -> list:
     return tasks
 
 
-def group_tasks(tasks: list) -> dict:
+def group_tasks(tasks):
     grouped = defaultdict(list)
     for task in tasks:
         grouped[task.get("category", "action")].append(task)
     return grouped
 
 
-def add_task(owner: str, category: str, task_text: str, priority: bool = False) -> str:
-    task_text = normalize_spaces(task_text)
+def format_task_line(task, show_id: bool = True, show_priority: bool = True):
+    flame = "🔥 " if task.get("priority") and show_priority else ""
+    task_id = f"{task['id']} " if show_id else ""
+    return f"{task_id}{flame}{task['task']}"
 
+
+def get_help_text():
+    return """
+PLB COMMANDS
+
+LISTS
+R?              = Richard full list
+N?              = Nick full list
+R TODAY         = Richard today view
+N TODAY         = Nick today view
+R NEXT          = Richard next action
+N NEXT          = Nick next action
+NEXT            = Global next priority/action task
+WDW             = Work done this week
+R DONE          = Richard completed today
+N DONE          = Nick completed today
+
+ADD TASKS
+R D task        = add daily task to Richard
+R A task        = add action item to Richard
+R L task        = add long term task to Richard
+N D task        = add daily task to Nick
+N A task        = add action item to Nick
+N L task        = add long term task to Nick
+
+HIGH PRIORITY
+R A ! task      = add high priority action item
+N A ! task      = add high priority action item
+
+COMPLETE
+R X 12          = complete Richard task by ID
+N X 15          = complete Nick task by ID
+
+WEB
+/dashboard      = full dashboard
+/today          = today command center
+/focus          = high priority focus page
+
+HELP
+HELP / CODES    = show this guide
+""".strip()
+
+
+def add_task(owner: str, category: str, task_text: str, priority: bool = False):
+    task_text = normalize_spaces(task_text)
     if not task_text:
         return "Task text cannot be empty."
 
@@ -132,32 +168,36 @@ def add_task(owner: str, category: str, task_text: str, priority: bool = False) 
     if existing.data:
         return f"Already exists for {DISPLAY_OWNER[owner]}."
 
-    insert_data = {
-        "owner": owner,
-        "category": category,
-        "task": task_text,
-        "status": "open",
-        "priority": priority,
-    }
-
-    supabase.table("tasks").insert(insert_data).execute()
+    (
+        supabase.table("tasks")
+        .insert(
+            {
+                "owner": owner,
+                "category": category,
+                "task": task_text,
+                "status": "open",
+                "priority": priority,
+            }
+        )
+        .execute()
+    )
 
     prefix = "🔥 " if priority else ""
     return f"✅ Added for {DISPLAY_OWNER[owner]}\n{DISPLAY_CATEGORY[category]}: {prefix}{task_text}"
 
 
-def complete_task_by_id(owner: str, task_id: int) -> str:
-    lookup = (
+def complete_task_by_id(owner: str, task_id: int):
+    task_lookup = (
         supabase.table("tasks")
         .select("id, owner, task, status")
         .eq("id", task_id)
         .execute()
     )
 
-    if not lookup.data:
+    if not task_lookup.data:
         return "Task ID not found."
 
-    task = lookup.data[0]
+    task = task_lookup.data[0]
 
     if task["owner"] != owner:
         return f"Task {task_id} does not belong to {DISPLAY_OWNER[owner]}."
@@ -172,143 +212,22 @@ def complete_task_by_id(owner: str, task_id: int) -> str:
         .execute()
     )
 
-    return f"✅ Completed\n{task['task']} [Task ID: {task_id}]"
+    return f"✅ Completed\n{task_id} {task['task']}"
 
 
-def move_task_by_id(owner: str, task_id: int, new_category: str) -> str:
-    lookup = (
-        supabase.table("tasks")
-        .select("id, owner, task, status, category")
-        .eq("id", task_id)
-        .execute()
-    )
-
-    if not lookup.data:
-        return "Task ID not found."
-
-    task = lookup.data[0]
-
-    if task["owner"] != owner:
-        return f"Task {task_id} does not belong to {DISPLAY_OWNER[owner]}."
-
-    if task["status"] != "open":
-        return f"Task {task_id} is not open and cannot be moved."
-
-    (
-        supabase.table("tasks")
-        .update({"category": new_category})
-        .eq("id", task_id)
-        .execute()
-    )
-
-    return (
-        f"✅ Task moved\n"
-        f"{task['task']} [Task ID: {task_id}]\n"
-        f"Category → {DISPLAY_CATEGORY[new_category]}"
-    )
-
-
-def clear_daily(owner: str) -> str:
-    daily_tasks = (
-        supabase.table("tasks")
-        .select("id")
-        .eq("owner", owner)
-        .eq("status", "open")
-        .eq("category", "daily")
-        .execute()
-    )
-
-    rows = daily_tasks.data or []
-
-    if not rows:
-        return f"{DISPLAY_OWNER[owner]} has no open Daily tasks."
-
-    ids = [row["id"] for row in rows]
-
-    (
-        supabase.table("tasks")
-        .update({"status": "completed", "completed_at": now_utc_iso()})
-        .in_("id", ids)
-        .execute()
-    )
-
-    return f"✅ Daily tasks cleared\n{len(ids)} task(s) completed for {DISPLAY_OWNER[owner]}"
-
-
-def get_owner_full_list(owner: str) -> str:
+def get_owner_today(owner: str):
     tasks = get_tasks(owner, status="open")
     grouped = group_tasks(tasks)
-
-    lines = [f"{DISPLAY_OWNER[owner]} — Punch List", ""]
-
-    priority_action = [t for t in grouped.get("action", []) if t.get("priority")]
-    regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
-    daily = grouped.get("daily", [])
-    long_term = grouped.get("long_term", [])
-
-    if priority_action:
-        lines.append(f"High Priority ({len(priority_action)})")
-        for task in priority_action:
-            lines.append(f"• {format_task_line(task)}")
-        lines.append("")
-
-    if regular_action:
-        lines.append(f"Action Items ({len(regular_action)})")
-        for task in regular_action:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if daily:
-        lines.append(f"Daily ({len(daily)})")
-        for task in daily:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if long_term:
-        lines.append(f"LT ({len(long_term)})")
-        for task in long_term:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if len(lines) == 2:
-        return f"{DISPLAY_OWNER[owner]} — Punch List\n\nNo open tasks."
-
-    return "\n".join(lines).strip()
-
-
-def get_owner_today(owner: str) -> str:
-    tasks = get_tasks(owner, status="open")
-    grouped = group_tasks(tasks)
-
-    priority_action = [t for t in grouped.get("action", []) if t.get("priority")]
-    regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
-    daily = grouped.get("daily", [])
-    long_term = grouped.get("long_term", [])
 
     lines = [f"{DISPLAY_OWNER[owner]} — Today", ""]
 
-    if priority_action:
-        lines.append(f"High Priority ({len(priority_action)})")
-        for task in priority_action:
-            lines.append(f"• {format_task_line(task)}")
-        lines.append("")
-
-    if daily:
-        lines.append(f"Daily ({len(daily)})")
-        for task in daily:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if regular_action:
-        lines.append(f"Action Items ({len(regular_action)})")
-        for task in regular_action:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if long_term:
-        lines.append(f"LT ({len(long_term)})")
-        for task in long_term:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
+    for category in ["daily", "action", "long_term"]:
+        section_tasks = grouped.get(category, [])
+        if not section_tasks:
+            continue
+        lines.append(f"{DISPLAY_CATEGORY[category]} ({len(section_tasks)})")
+        for task in section_tasks:
+            lines.append(f"• {format_task_line(task, show_id=True, show_priority=True)}")
         lines.append("")
 
     if len(lines) == 2:
@@ -317,18 +236,18 @@ def get_owner_today(owner: str) -> str:
     return "\n".join(lines).strip()
 
 
-def get_owner_next(owner: str) -> str:
+def get_owner_next(owner: str):
     tasks = get_tasks(owner, status="open")
     action_tasks = [t for t in tasks if t.get("category") == "action"]
 
     if not action_tasks:
-        return f"{DISPLAY_OWNER[owner]} has no open Action Items."
+        return f"{DISPLAY_OWNER[owner]} has no open action items."
 
     next_task = action_tasks[0]
-    return f"{DISPLAY_OWNER[owner]} — Next\n\n{format_task_line(next_task)}"
+    return f"{DISPLAY_OWNER[owner]} — Next\n\n{format_task_line(next_task, show_id=True, show_priority=True)}"
 
 
-def get_global_next() -> str:
+def get_global_next():
     all_tasks = []
     for owner in ["richard", "nick"]:
         all_tasks.extend(get_tasks(owner, status="open"))
@@ -336,7 +255,7 @@ def get_global_next() -> str:
     action_tasks = [t for t in all_tasks if t.get("category") == "action"]
 
     if not action_tasks:
-        return "No open Action Items."
+        return "No open action items."
 
     action_tasks.sort(
         key=lambda t: (
@@ -348,10 +267,31 @@ def get_global_next() -> str:
 
     next_task = action_tasks[0]
     owner_name = DISPLAY_OWNER[next_task["owner"]]
-    return f"Next Task\n\n{owner_name}: {format_task_line(next_task)}"
+    return f"Next Task\n\n{owner_name}: {format_task_line(next_task, show_id=True, show_priority=True)}"
 
 
-def get_completed_since(owner: Optional[str], since_dt: datetime, title: str) -> str:
+def get_owner_full_list(owner: str):
+    tasks = get_tasks(owner, status="open")
+    grouped = group_tasks(tasks)
+
+    lines = [f"{DISPLAY_OWNER[owner]} — Punch List", ""]
+
+    for category in SECTION_ORDER:
+        section_tasks = grouped.get(category, [])
+        if not section_tasks:
+            continue
+        lines.append(f"{DISPLAY_CATEGORY[category]} ({len(section_tasks)})")
+        for task in section_tasks:
+            lines.append(f"• {format_task_line(task, show_id=True, show_priority=True)}")
+        lines.append("")
+
+    if len(lines) == 2:
+        return f"{DISPLAY_OWNER[owner]} — Punch List\n\nNo open tasks."
+
+    return "\n".join(lines).strip()
+
+
+def get_completed_since(owner: str | None, since_dt: datetime, title: str):
     query = (
         supabase.table("tasks")
         .select("id, owner, task, completed_at")
@@ -373,7 +313,6 @@ def get_completed_since(owner: Optional[str], since_dt: datetime, title: str) ->
 
     lines = [title, ""]
     grouped = defaultdict(list)
-
     for task in tasks:
         grouped[task["owner"]].append(task)
 
@@ -383,76 +322,23 @@ def get_completed_since(owner: Optional[str], since_dt: datetime, title: str) ->
             continue
         lines.append(DISPLAY_OWNER[owner_key])
         for task in owner_tasks:
-            lines.append(f"✓ {task['task']} [Task ID: {task['id']}]")
+            lines.append(f"✓ {task['id']} {task['task']}")
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
-def get_completed_today(owner: str) -> str:
+def get_completed_today(owner: str):
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     return get_completed_since(owner, start, f"{DISPLAY_OWNER[owner]} — Completed Today")
 
 
-def get_wdw() -> str:
+def get_wdw():
     start = datetime.now(timezone.utc) - timedelta(days=7)
     return get_completed_since(None, start, "Work Done This Week")
 
 
-def get_help_text() -> str:
-    return """
-PLB COMMANDS
-
-LISTS
-R?                  = Richard full list
-N?                  = Nick full list
-R TODAY             = Richard today view
-N TODAY             = Nick today view
-R NEXT              = Richard next action
-N NEXT              = Nick next action
-NEXT                = Global next action item
-WDW                 = Work done this week
-R DONE              = Richard completed today
-N DONE              = Nick completed today
-
-ADD TASKS
-R D task            = Add Daily task
-R A task            = Add Action Item
-R + task            = Add Action Item
-R LT task           = Add LT task
-
-HIGH PRIORITY
-R A ! task          = Add high priority Action Item
-R + ! task          = Add high priority Action Item
-
-COMPLETE
-R X 12              = Complete task by ID
-N X 15              = Complete task by ID
-
-MOVE
-R MOVE 12 DAILY     = Move task to Daily
-R MOVE 12 ACTION    = Move task to Action Items
-R MOVE 12 LT        = Move task to LT
-
-CLEAR DAILY
-R CLEAR DAILY       = Complete all open Daily tasks
-N CLEAR DAILY       = Complete all open Daily tasks
-
-WEB
-/dashboard          = Full dashboard
-/today              = Today command center
-/focus              = Focus mode
-
-HELP
-HELP / CODES        = Show this guide
-""".strip()
-
-
-# -------------------------
-# SMS Parsing
-# -------------------------
-
-def parse_sms_command(body: str) -> dict:
+def parse_sms_command(body: str):
     raw = normalize_spaces(body)
     lowered = raw.lower()
 
@@ -486,69 +372,40 @@ def parse_sms_command(body: str) -> dict:
         owner = VALID_OWNERS[owner_done.group(1)]
         return {"type": "done_today", "owner": owner}
 
-    owner_clear_daily = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*clear\s+daily", lowered)
-    if owner_clear_daily:
-        owner = VALID_OWNERS[owner_clear_daily.group(1)]
-        return {"type": "clear_daily", "owner": owner}
-
     complete_match = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*x\s+(\d+)", lowered)
     if complete_match:
         owner = VALID_OWNERS[complete_match.group(1)]
         task_id = int(complete_match.group(2))
         return {"type": "complete", "owner": owner, "task_id": task_id}
 
-    move_match = re.fullmatch(
-        r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm)",
-        lowered,
-    )
-    if move_match:
-        owner = VALID_OWNERS[move_match.group(1)]
-        task_id = int(move_match.group(2))
-        category = VALID_CATEGORIES[move_match.group(3)]
-        return {"type": "move", "owner": owner, "task_id": task_id, "category": category}
-
-    add_plus_match = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+(!)?\s*(.+)", lowered)
-    if add_plus_match:
-        owner = VALID_OWNERS[add_plus_match.group(1)]
-        priority = bool(add_plus_match.group(2))
-        task_text = raw.split("+", 1)[1].strip()
-        if priority and task_text.startswith("!"):
-            task_text = task_text[1:].strip()
-        return {
-            "type": "add",
-            "owner": owner,
-            "category": "action",
-            "priority": priority,
-            "task_text": task_text,
-        }
-
     add_match = re.fullmatch(
-        r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+(!)?\s*(.+)",
+        r"(richard|r|nick|n|rn|both)\s*:?\s+(daily|d|action|a|long_term|long|long term|l)\s+(!)?\s*(.+)",
         lowered,
     )
     if add_match:
-        owner = VALID_OWNERS[add_match.group(1)]
-        category = VALID_CATEGORIES[add_match.group(2)]
-        priority = bool(add_match.group(3))
-        task_text = raw.split(maxsplit=2)[-1]
+        owner_raw = add_match.group(1)
+        category_raw = add_match.group(2).replace(" ", "_")
+        priority_flag = bool(add_match.group(3))
+        task_text = raw.split(maxsplit=3)[-1]
 
-        # Clean task text for priority marker
-        if priority:
-            bang_index = task_text.find("!")
-            if bang_index != -1:
-                task_text = task_text[bang_index + 1:].strip()
+        owner = VALID_OWNERS[owner_raw]
+        category = VALID_CATEGORIES[category_raw]
+
+        if priority_flag and task_text.startswith("!"):
+            task_text = task_text[1:].strip()
 
         return {
             "type": "add",
             "owner": owner,
             "category": category,
-            "priority": priority,
+            "priority": priority_flag,
             "task_text": task_text,
         }
 
     legacy_add_match = re.fullmatch(r"(richard|r|nick|n|rn)\s*:\s*(.+)", lowered)
     if legacy_add_match:
-        owner = VALID_OWNERS[legacy_add_match.group(1)]
+        owner_raw = legacy_add_match.group(1)
+        owner = VALID_OWNERS[owner_raw]
         task_text = raw.split(":", 1)[1].strip()
         return {
             "type": "legacy_add",
@@ -595,12 +452,6 @@ async def sms_reply(request: Request):
     if command["type"] == "complete":
         return twiml(complete_task_by_id(command["owner"], command["task_id"]))
 
-    if command["type"] == "move":
-        return twiml(move_task_by_id(command["owner"], command["task_id"], command["category"]))
-
-    if command["type"] == "clear_daily":
-        return twiml(clear_daily(command["owner"]))
-
     if command["type"] == "add":
         if command["owner"] == "both":
             result_one = add_task("richard", command["category"], command["task_text"], command["priority"])
@@ -628,7 +479,7 @@ async def sms_reply(request: Request):
 
 
 # -------------------------
-# Web Completion Endpoint
+# Task Complete Endpoint
 # -------------------------
 
 @app.post("/complete/{task_id}")
@@ -643,10 +494,10 @@ def complete_task_web(task_id: int):
 
 
 # -------------------------
-# Dashboard Rendering
+# Dashboard HTML Helpers
 # -------------------------
 
-def render_section(title: str, tasks: list, highlight_priority: bool = False) -> str:
+def render_section(title: str, tasks: list, highlight_priority: bool = False):
     if not tasks:
         return ""
 
@@ -661,7 +512,7 @@ def render_section(title: str, tasks: list, highlight_priority: bool = False) ->
         section_html += f"""
             <label class="task-row">
                 <input type="checkbox" onclick="completeTask({task['id']})">
-                <span class="task-text">{flame}{escape_text(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span></span>
+                <span class="task-text">{flame}{escape_text(task['task'])}</span>
             </label>
         """
 
@@ -672,9 +523,9 @@ def render_section(title: str, tasks: list, highlight_priority: bool = False) ->
     return section_html
 
 
-def render_owner_panel(owner: str, tasks: list) -> str:
+def render_owner_panel(owner: str, tasks: list):
     grouped = group_tasks(tasks)
-    high_priority = [t for t in grouped.get("action", []) if t.get("priority")]
+    high_priority = [t for t in tasks if t.get("priority") and t.get("category") == "action"]
     regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
     daily = grouped.get("daily", [])
     long_term = grouped.get("long_term", [])
@@ -685,12 +536,12 @@ def render_owner_panel(owner: str, tasks: list) -> str:
         {render_section("High Priority", high_priority, highlight_priority=True)}
         {render_section("Action Items", regular_action)}
         {render_section("Daily", daily)}
-        {render_section("LT", long_term)}
+        {render_section("Long Term", long_term)}
     </div>
     """
 
 
-def base_page(title: str, content: str) -> str:
+def base_page(title: str, content: str, subtitle_links: str = ""):
     return f"""
     <html>
     <head>
@@ -797,13 +648,14 @@ def base_page(title: str, content: str) -> str:
                 display: inline-block;
             }}
 
-            .task-id {{
-                color: #666;
-                font-size: 0.95rem;
-            }}
-
             .flame {{
                 margin-right: 8px;
+            }}
+
+            .footer-tools {{
+                margin-top: 18px;
+                color: #555;
+                font-size: 0.95rem;
             }}
 
             .focus-board {{
@@ -867,6 +719,7 @@ def base_page(title: str, content: str) -> str:
                 <a href="/dashboard">Dashboard</a>
                 <a href="/today">Today Command Center</a>
                 <a href="/focus">Focus Mode</a>
+                {subtitle_links}
             </div>
         </div>
         {content}
@@ -896,10 +749,10 @@ def dashboard():
 
 @app.get("/today", response_class=HTMLResponse)
 def today_page():
-    def render_today_panel(owner: str) -> str:
+    def render_today_panel(owner):
         tasks = get_tasks(owner, status="open")
         grouped = group_tasks(tasks)
-        priority = [t for t in grouped.get("action", []) if t.get("priority")]
+        priority = [t for t in tasks if t.get("priority") and t.get("category") == "action"]
         daily = grouped.get("daily", [])
         action = [t for t in grouped.get("action", []) if not t.get("priority")]
 
@@ -924,21 +777,21 @@ def today_page():
 
 @app.get("/focus", response_class=HTMLResponse)
 def focus_page():
-    def render_focus_card(owner: str) -> str:
+    def render_focus_card(owner):
         tasks = [
             t for t in get_tasks(owner, status="open")
             if t.get("priority") and t.get("category") == "action"
         ]
 
         if not tasks:
-            task_html = '<div class="empty">No high priority Action Items.</div>'
+            task_html = '<div class="empty">No high priority action items.</div>'
         else:
             task_html = ""
             for task in tasks:
                 task_html += f"""
                 <label class="task-row">
                     <input type="checkbox" onclick="completeTask({task['id']})">
-                    <span class="task-text"><span class="flame">🔥</span>{escape_text(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span></span>
+                    <span class="task-text"><span class="flame">🔥</span>{escape_text(task['task'])}</span>
                 </label>
                 """
 
