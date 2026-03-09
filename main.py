@@ -12,9 +12,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ---------------------------
-# Utility: Twilio Response
-# ---------------------------
+# -------------------------
+# Twilio Response Helper
+# -------------------------
 
 def twiml(message):
     resp = MessagingResponse()
@@ -22,9 +22,9 @@ def twiml(message):
     return HTMLResponse(str(resp), media_type="application/xml")
 
 
-# ---------------------------
+# -------------------------
 # Add Task
-# ---------------------------
+# -------------------------
 
 def add_task(owner, task):
 
@@ -38,9 +38,9 @@ def add_task(owner, task):
     return f"✅ Task added\n{owner.capitalize()}: {task}"
 
 
-# ---------------------------
-# Get Today View
-# ---------------------------
+# -------------------------
+# TODAY View
+# -------------------------
 
 def get_today(owner):
 
@@ -72,9 +72,9 @@ def get_today(owner):
     return msg
 
 
-# ---------------------------
-# Get Next Task
-# ---------------------------
+# -------------------------
+# NEXT TASK
+# -------------------------
 
 def get_next():
 
@@ -91,9 +91,9 @@ def get_next():
     return "No open tasks."
 
 
-# ---------------------------
-# Help Command
-# ---------------------------
+# -------------------------
+# HELP TEXT
+# -------------------------
 
 def help_text():
 
@@ -103,7 +103,7 @@ PLB COMMANDS
 ADD TASK
 R: task → add task to Richard
 N: task → add task to Nick
-RN: task → add to both
+RN: task → add to both lists
 
 TODAY
 r today
@@ -112,26 +112,20 @@ n today
 NEXT TASK
 next
 
-REPORTING
-wdw → tasks completed this week
-wlm → last week completed
-wdm → month completed
-
 SYSTEM
-help / codes → show commands
+help or codes → show commands
 """
 
 
-# ---------------------------
+# -------------------------
 # SMS Endpoint
-# ---------------------------
+# -------------------------
 
 @app.post("/sms")
 async def sms_reply(request: Request):
 
     form = await request.form()
     body = form.get("Body", "")
-
     msg = body.lower().strip()
 
 
@@ -141,7 +135,7 @@ async def sms_reply(request: Request):
         return twiml(help_text())
 
 
-    # TODAY
+    # TODAY COMMAND
 
     if "today" in msg:
 
@@ -152,7 +146,7 @@ async def sms_reply(request: Request):
             return twiml(get_today("nick"))
 
 
-    # NEXT
+    # NEXT COMMAND
 
     if msg == "next":
         return twiml(get_next())
@@ -162,7 +156,7 @@ async def sms_reply(request: Request):
 
     if msg.startswith("r:") or msg.startswith("richard:"):
 
-        task = body.split(":",1)[1].strip()
+        task = body.split(":", 1)[1].strip()
         return twiml(add_task("richard", task))
 
 
@@ -170,7 +164,7 @@ async def sms_reply(request: Request):
 
     if msg.startswith("n:") or msg.startswith("nick:"):
 
-        task = body.split(":",1)[1].strip()
+        task = body.split(":", 1)[1].strip()
         return twiml(add_task("nick", task))
 
 
@@ -178,11 +172,21 @@ async def sms_reply(request: Request):
 
     if msg.startswith("rn:"):
 
-        task = body.split(":",1)[1].strip()
+        task = body.split(":", 1)[1].strip()
 
         supabase.table("tasks").insert([
-            {"owner":"richard","category":"action","task":task,"status":"open"},
-            {"owner":"nick","category":"action","task":task,"status":"open"}
+            {
+                "owner": "richard",
+                "category": "action",
+                "task": task,
+                "status": "open"
+            },
+            {
+                "owner": "nick",
+                "category": "action",
+                "task": task,
+                "status": "open"
+            }
         ]).execute()
 
         return twiml(f"✅ Task added to both\n{task}")
@@ -191,22 +195,38 @@ async def sms_reply(request: Request):
     return twiml("Command not recognized. Text HELP.")
 
 
-# ---------------------------
-# Dashboard Webpage
-# ---------------------------
+# -------------------------
+# MARK TASK COMPLETE
+# -------------------------
+
+@app.post("/complete/{task_id}")
+def complete_task(task_id: int):
+
+    supabase.table("tasks") \
+        .update({"status": "completed"}) \
+        .eq("id", task_id) \
+        .execute()
+
+    return {"success": True}
+
+
+# -------------------------
+# DASHBOARD
+# -------------------------
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
 
     richard = supabase.table("tasks") \
-        .eq("status","open") \
+        .select("*") \
+        .eq("owner", "richard") \
+        .eq("status", "open") \
         .execute().data
 
     nick = supabase.table("tasks") \
         .select("*") \
-        .eq("owner","nick") \
-        .eq("status","open") \
-
+        .eq("owner", "nick") \
+        .eq("status", "open") \
         .execute().data
 
 
@@ -214,56 +234,80 @@ def dashboard():
 
         html = f"<h2>{owner}</h2><ul>"
 
-
         for t in tasks:
-            html += f"<li><b>{t['category']}</b>: {t['task']}</li>"
+
+            html += f"""
+            <li>
+                <input type="checkbox" onclick="completeTask({t['id']})">
+                <b>{t['category']}</b>: {t['task']}
+            </li>
+            """
 
         html += "</ul>"
+
         return html
 
 
     page = f"""
-    <html>
+<html>
 
-    <head>
+<head>
 
-    <title>Punch List Dashboard</title>
+<title>Punch List Dashboard</title>
 
-    <style>
+<style>
 
-    body {{
-        font-family: Arial;
-        padding:40px;
-        background:#f7f7f7
-    }}
+body {{
+    font-family: Arial;
+    padding:40px;
+    background:#f7f7f7
+}}
 
-    h1 {{
-        margin-bottom:30px
-    }}
+h1 {{
+    margin-bottom:30px
+}}
 
-    h2 {{
-        margin-top:40px
-    }}
+h2 {{
+    margin-top:40px
+}}
 
-    li {{
-        margin:6px 0
-    }}
+li {{
+    margin:8px 0
+}}
 
-    </style>
+</style>
 
-    </head>
+<script>
 
-    <body>
+function completeTask(id) {{
 
-    <h1>Briefly Home Punch Lists</h1>
+    fetch("/complete/" + id, {{
+        method: "POST"
+    }}).then(() => {{
+        location.reload()
+    }})
 
-    {render("Richard", richard)}
+}}
 
-    {render("Nick", nick)}
+setInterval(function(){{
+    location.reload()
+}}, 5000)
 
-    </body>
+</script>
 
-    </html>
-    """
+</head>
+
+<body>
+
+<h1>Briefly Home Punch Lists</h1>
+
+{render("Richard", richard)}
+
+{render("Nick", nick)}
+
+</body>
+
+</html>
+"""
 
     return page
