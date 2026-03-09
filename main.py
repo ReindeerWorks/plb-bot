@@ -1,111 +1,228 @@
 from fastapi import FastAPI, Form
 from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
-import requests
-from datetime import datetime
+from supabase import create_client
+import os
+from datetime import datetime, timedelta
+import re
 
 app = FastAPI()
 
-SUPABASE_URL = "https://tznwonivnvbqwxpqrulf.supabase.co"
-SUPABASE_KEY = "sb_publishable_zcQVfrbf5YtMuODbei27qg_1-IsyBUE"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-headers = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json"
-}
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def parse_command(text):
 
+def normalize_command(text):
     text = text.strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
-    if text.startswith("R:"):
-        owner = "Richard"
-        command = text[2:].strip()
 
-    elif text.startswith("N:"):
-        owner = "Nick"
-        command = text[2:].strip()
+def get_help():
 
-    elif text.startswith("RN:"):
-        owner = "Both"
-        command = text[3:].strip()
+    message = (
+        "Punch List Bot Commands\n\n"
 
-    elif text.startswith("PLB:"):
-        return {"type": "query", "command": text[4:].strip()}
+        "LISTS\n"
+        "R?  → Richard Daily + Action tasks\n"
+        "N?  → Nick Daily + Action tasks\n"
+        "NEXT → Next steps list\n\n"
 
-    else:
-        return {"type": "unknown"}
+        "TASK MANAGEMENT\n"
+        "R: task → Add task to Richard\n"
+        "N: task → Add task to Nick\n"
+        "R: X # → Complete Richard task\n"
+        "N: X # → Complete Nick task\n\n"
 
-    if command.startswith("+"):
-        return {"type": "add", "owner": owner, "task": command[1:].strip()}
+        "REPORTS\n"
+        "WDW → Work Done This Week\n\n"
 
-    if command.startswith("X") or command.startswith("-"):
-        return {"type": "complete", "owner": owner, "task": command[1:].strip()}
+        "HELP\n"
+        "HELP / CODES → Show this guide"
+    )
 
-    return {"type": "unknown"}
+    return message
+
+
+def get_punch_list(owner):
+
+    response = supabase.table("tasks") \
+        .select("id,category,task") \
+        .eq("owner", owner) \
+        .eq("status", "open") \
+        .execute()
+
+    daily = []
+    action = []
+
+    for row in response.data:
+
+        line = f"{row['id']} {row['task']}"
+
+        if row["category"] == "daily":
+            daily.append(line)
+
+        elif row["category"] == "action":
+            action.append(line)
+
+    message = f"{owner} — Punch List\n\n"
+
+    if daily:
+        message += "Daily\n"
+        message += "\n".join(daily)
+        message += "\n\n"
+
+    if action:
+        message += "Action\n"
+        message += "\n".join(action)
+
+    return message
+
+
+def get_next_steps():
+
+    response = supabase.table("tasks") \
+        .select("id,owner,task,category") \
+        .eq("status", "open") \
+        .execute()
+
+    message = "Next Steps\n\n"
+
+    for row in response.data:
+
+        if row["category"] in ["daily", "action"]:
+            message += f"{row['owner']} {row['id']} {row['task']}\n"
+
+    return message
+
+
+def get_wdw():
+
+    week_start = datetime.utcnow() - timedelta(days=7)
+
+    response = supabase.table("tasks") \
+        .select("owner,task") \
+        .eq("status", "completed") \
+        .gte("completed_at", week_start.isoformat()) \
+        .execute()
+
+    richard = []
+    nick = []
+
+    for row in response.data:
+
+        if row["owner"] == "Richard":
+            richard.append(f"✔ {row['task']}")
+
+        if row["owner"] == "Nick":
+            nick.append(f"✔ {row['task']}")
+
+    message = "Work Done This Week\n\n"
+
+    if richard:
+        message += "Richard\n"
+        message += "\n".join(richard)
+        message += "\n\n"
+
+    if nick:
+        message += "Nick\n"
+        message += "\n".join(nick)
+
+    return message
+
 
 @app.post("/sms")
-async def sms_reply(Body: str = Form(...)):
+async def sms(Body: str = Form(...)):
 
-    cmd = parse_command(Body)
+    body = normalize_command(Body)
+    body_upper = body.upper()
 
     resp = MessagingResponse()
 
-    if cmd["type"] == "add":
+    # HELP / CODES
+    if body_upper in ["HELP", "CODES", "COMMANDS"]:
+        resp.message(get_help())
+        return Response(str(resp), media_type="application/xml")
 
-        data = {
-            "owner": cmd["owner"],
-            "task": cmd["task"],
-            "status": "open"
-        }
+    # R?
+    if re.match(r"^R\s*\?$", body_upper):
+        resp.message(get_punch_list("Richard"))
+        return Response(str(resp), media_type="application/xml")
 
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/tasks",
-            headers=headers,
-            json=data
-        )
+    # N?
+    if re.match(r"^N\s*\?$", body_upper):
+        resp.message(get_punch_list("Nick"))
+        return Response(str(resp), media_type="application/xml")
 
-        resp.message(f"✔ Task added\n{cmd['owner']}: {cmd['task']}")
+    # NEXT
+    if body_upper == "NEXT":
+        resp.message(get_next_steps())
+        return Response(str(resp), media_type="application/xml")
 
-    elif cmd["type"] == "complete":
+    # WDW
+    if body_upper == "WDW":
+        resp.message(get_wdw())
+        return Response(str(resp), media_type="application/xml")
 
-        task = cmd["task"]
+    # ADD OR COMPLETE TASKS
 
-        requests.patch(
-            f"{SUPABASE_URL}/rest/v1/tasks?task=eq.{task}",
-            headers=headers,
-            json={
-                "status": "completed",
-                "completed_at": datetime.utcnow().isoformat()
-            }
-        )
+    if re.match(r"^R\s*:", body_upper):
 
-        resp.message(f"✔ Task completed\n{task}")
+        task_text = body.split(":", 1)[1].strip()
 
-    elif cmd["type"] == "query":
+        if task_text.upper().startswith("X"):
 
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/tasks?status=eq.open",
-            headers=headers
-        )
+            task_id = task_text[1:].strip()
 
-        tasks = r.json()
+            supabase.table("tasks") \
+                .update({
+                    "status": "completed",
+                    "completed_at": datetime.utcnow().isoformat()
+                }) \
+                .eq("id", task_id) \
+                .execute()
 
-        if not tasks:
-            resp.message("No open tasks.")
-        else:
-            text = "Open Tasks:\n"
-            for t in tasks[:10]:
-                text += f"• {t['owner']}: {t['task']}\n"
+            resp.message("✔ Richard task completed")
+            return Response(str(resp), media_type="application/xml")
 
-            resp.message(text)
+        supabase.table("tasks").insert({
+            "owner": "Richard",
+            "task": task_text,
+            "category": "action"
+        }).execute()
 
-    else:
+        resp.message("✔ Task added for Richard")
+        return Response(str(resp), media_type="application/xml")
 
-        resp.message("Command not recognized.")
+    if re.match(r"^N\s*:", body_upper):
 
-    return Response(
-    	content=str(resp),
-    	media_type="text/xml"
-    )
+        task_text = body.split(":", 1)[1].strip()
+
+        if task_text.upper().startswith("X"):
+
+            task_id = task_text[1:].strip()
+
+            supabase.table("tasks") \
+                .update({
+                    "status": "completed",
+                    "completed_at": datetime.utcnow().isoformat()
+                }) \
+                .eq("id", task_id) \
+                .execute()
+
+            resp.message("✔ Nick task completed")
+            return Response(str(resp), media_type="application/xml")
+
+        supabase.table("tasks").insert({
+            "owner": "Nick",
+            "task": task_text,
+            "category": "action"
+        }).execute()
+
+        resp.message("✔ Task added for Nick")
+        return Response(str(resp), media_type="application/xml")
+
+    resp.message("Unknown command. Text HELP for command list.")
+    return Response(str(resp), media_type="application/xml")
