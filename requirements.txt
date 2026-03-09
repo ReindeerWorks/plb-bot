@@ -2,6 +2,5 @@ fastapi
 uvicorn
 requests
 twilio
-python-multipart
 supabase
 python-multipart
