@@ -106,4 +106,8 @@ async def sms_reply(Body: str = Form(...)):
 
         resp.message("Command not recognized.")
 
-    return Response(content=str(resp), media_type="application/xml")
+    return Response(
+    	content=str(resp),
+	media_type="application/xml",
+	headers={"Content-Type": "text/xml"}
+    )
