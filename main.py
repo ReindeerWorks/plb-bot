@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Form
+from fastapi.responses import Response
 from twilio.twiml.messaging_response import MessagingResponse
 import requests
 from datetime import datetime
@@ -43,6 +44,7 @@ def parse_command(text):
         return {"type": "complete", "owner": owner, "task": command[1:].strip()}
 
     return {"type": "unknown"}
+
 
 @app.post("/sms")
 async def sms_reply(Body: str = Form(...)):
@@ -104,4 +106,4 @@ async def sms_reply(Body: str = Form(...)):
 
         resp.message("Command not recognized.")
 
-    return str(resp)
+    return Response(content=str(resp), media_type="application/xml")
