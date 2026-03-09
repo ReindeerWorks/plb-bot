@@ -45,7 +45,7 @@ DISPLAY_CATEGORY = {
     "long_term": "LT",
 }
 
-FAVICON_FILE = Path("BH BOT.jpg")
+FAVICON_FILE = Path("robot.jpg")
 
 
 # -------------------------
