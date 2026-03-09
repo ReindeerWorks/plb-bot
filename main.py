@@ -1,9 +1,10 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from supabase import create_client
 from twilio.twiml.messaging_response import MessagingResponse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 import os
 import html
@@ -19,11 +20,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-# -------------------------
-# Constants
-# -------------------------
-
+DISPLAY_OWNER = {"richard": "Richard", "nick": "Nick"}
 VALID_OWNERS = {
     "r": "richard",
     "richard": "richard",
@@ -32,7 +29,6 @@ VALID_OWNERS = {
     "rn": "both",
     "both": "both",
 }
-
 VALID_CATEGORIES = {
     "d": "daily",
     "daily": "daily",
@@ -43,19 +39,13 @@ VALID_CATEGORIES = {
     "long_term": "long_term",
     "longterm": "long_term",
 }
-
-DISPLAY_OWNER = {
-    "richard": "Richard",
-    "nick": "Nick",
-}
-
 DISPLAY_CATEGORY = {
     "daily": "Daily",
     "action": "Action Items",
     "long_term": "LT",
 }
 
-SECTION_ORDER = ["daily", "action", "long_term"]
+FAVICON_FILE = Path("BH BOT.jpg")
 
 
 # -------------------------
@@ -68,50 +58,148 @@ def twiml(message: str) -> HTMLResponse:
     return HTMLResponse(str(resp), media_type="application/xml")
 
 
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc().isoformat()
 
 
-def escape_text(text: str) -> str:
+def today_utc() -> date:
+    return now_utc().date()
+
+
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def esc(text: str) -> str:
     return html.escape(text or "")
 
 
-def format_task_line(task: dict, show_priority: bool = True) -> str:
-    flame = "🔥 " if task.get("priority") and show_priority else ""
-    return f"{flame}{task['task']} [Task ID: {task['id']}]"
+def parse_date_safe(value) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return date.fromisoformat(str(value))
+        except Exception:
+            return None
 
 
-def get_tasks(owner: str, status: str = "open") -> list:
+def is_daily_completed_today(task: dict) -> bool:
+    if task.get("category") != "daily":
+        return False
+    return parse_date_safe(task.get("last_completed_date")) == today_utc()
+
+
+def task_age_days(task: dict) -> int:
+    created = task.get("created_at")
+    if not created:
+        return 0
+    try:
+        created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        return max(0, (now_utc() - created_dt).days)
+    except Exception:
+        return 0
+
+
+def is_overdue(task: dict) -> bool:
+    return (
+        task.get("category") == "action"
+        and task.get("status") == "open"
+        and not task.get("priority")
+        and task_age_days(task) >= 3
+    )
+
+
+def sort_key(task: dict):
+    category = task.get("category") or "action"
+    if task.get("priority") and category == "action":
+        bucket = 0
+    elif is_overdue(task):
+        bucket = 1
+    elif category == "action":
+        bucket = 2
+    elif category == "daily":
+        bucket = 3
+    elif category == "long_term":
+        bucket = 4
+    else:
+        bucket = 5
+    return (bucket, -(task_age_days(task)), str(task.get("created_at") or ""), int(task.get("id") or 0))
+
+
+def format_task_line(task: dict, include_age: bool = False) -> str:
+    prefix = ""
+    if task.get("priority") and task.get("category") == "action":
+        prefix = "🔥 "
+    elif is_overdue(task):
+        prefix = "⚠ "
+    age_text = f" · {task_age_days(task)}d old" if include_age and task_age_days(task) > 0 else ""
+    return f"{prefix}{task.get('task', '')} [Task ID: {task.get('id')}]{age_text}"
+
+
+# -------------------------
+# Data access
+# -------------------------
+
+def get_owner_rows(owner: str) -> list:
+    response = supabase.table("tasks").select("*").eq("owner", owner).execute()
+    return response.data or []
+
+
+def get_open_visible_tasks(owner: str) -> list:
+    rows = get_owner_rows(owner)
+    visible = []
+    for task in rows:
+        category = task.get("category") or "action"
+        status = task.get("status") or "open"
+
+        if category == "daily":
+            if not is_daily_completed_today(task):
+                visible.append(task)
+        else:
+            if status == "open":
+                visible.append(task)
+
+    visible.sort(key=sort_key)
+    return visible
+
+
+def get_completed_tasks_since(since_dt: datetime, owner: Optional[str] = None) -> list:
     response = (
         supabase.table("tasks")
         .select("*")
-        .eq("owner", owner)
-        .eq("status", status)
+        .gte("completed_at", since_dt.isoformat())
         .execute()
     )
 
     tasks = response.data or []
-    tasks.sort(
-        key=lambda t: (
-            0 if t.get("priority") and t.get("category") == "action" else 1,
-            SECTION_ORDER.index(t["category"]) if t.get("category") in SECTION_ORDER else 999,
-            t.get("created_at") or "",
-            t.get("id") or 0,
-        )
-    )
-    return tasks
+    filtered = []
 
-
-def group_tasks(tasks: list) -> dict:
-    grouped = defaultdict(list)
     for task in tasks:
-        grouped[task.get("category", "action")].append(task)
-    return grouped
+        if owner and task.get("owner") != owner:
+            continue
+        if task.get("completed_at"):
+            filtered.append(task)
 
+    filtered.sort(key=lambda t: str(t.get("completed_at") or ""), reverse=True)
+    return filtered
+
+
+# -------------------------
+# Task actions
+# -------------------------
 
 def add_task(owner: str, category: str, task_text: str, priority: bool = False) -> str:
     task_text = normalize_spaces(task_text)
@@ -119,20 +207,30 @@ def add_task(owner: str, category: str, task_text: str, priority: bool = False) 
     if not task_text:
         return "Task text cannot be empty."
 
-    existing = (
-        supabase.table("tasks")
-        .select("id")
-        .eq("owner", owner)
-        .eq("status", "open")
-        .eq("category", category)
-        .eq("task", task_text)
-        .execute()
-    )
+    if category == "daily":
+        existing = (
+            supabase.table("tasks")
+            .select("id")
+            .eq("owner", owner)
+            .eq("category", category)
+            .eq("task", task_text)
+            .execute()
+        )
+    else:
+        existing = (
+            supabase.table("tasks")
+            .select("id")
+            .eq("owner", owner)
+            .eq("status", "open")
+            .eq("category", category)
+            .eq("task", task_text)
+            .execute()
+        )
 
     if existing.data:
         return f"Already exists for {DISPLAY_OWNER[owner]}."
 
-    insert_data = {
+    payload = {
         "owner": owner,
         "category": category,
         "task": task_text,
@@ -140,135 +238,119 @@ def add_task(owner: str, category: str, task_text: str, priority: bool = False) 
         "priority": priority,
     }
 
-    supabase.table("tasks").insert(insert_data).execute()
+    if category == "daily":
+        payload["last_completed_date"] = None
 
-    prefix = "🔥 " if priority else ""
+    supabase.table("tasks").insert(payload).execute()
+
+    prefix = "🔥 " if priority and category == "action" else ""
     return f"✅ Added for {DISPLAY_OWNER[owner]}\n{DISPLAY_CATEGORY[category]}: {prefix}{task_text}"
 
 
 def complete_task_by_id(owner: str, task_id: int) -> str:
-    lookup = (
-        supabase.table("tasks")
-        .select("id, owner, task, status")
-        .eq("id", task_id)
-        .execute()
-    )
+    lookup = supabase.table("tasks").select("*").eq("id", task_id).execute()
 
     if not lookup.data:
         return "Task ID not found."
 
     task = lookup.data[0]
 
-    if task["owner"] != owner:
+    if task.get("owner") != owner:
         return f"Task {task_id} does not belong to {DISPLAY_OWNER[owner]}."
 
-    if task["status"] == "completed":
+    category = task.get("category") or "action"
+
+    if category == "daily":
+        supabase.table("tasks").update(
+            {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+        ).eq("id", task_id).execute()
+
+        return f"✅ Daily task completed for today\n{task.get('task')} [Task ID: {task_id}]"
+
+    if task.get("status") == "completed":
         return f"Task {task_id} is already completed."
 
-    (
-        supabase.table("tasks")
-        .update({"status": "completed", "completed_at": now_utc_iso()})
-        .eq("id", task_id)
-        .execute()
-    )
+    supabase.table("tasks").update(
+        {"status": "completed", "completed_at": now_utc_iso()}
+    ).eq("id", task_id).execute()
 
-    return f"✅ Completed\n{task['task']} [Task ID: {task_id}]"
+    return f"✅ Completed\n{task.get('task')} [Task ID: {task_id}]"
 
 
 def move_task_by_id(owner: str, task_id: int, new_category: str) -> str:
-    lookup = (
-        supabase.table("tasks")
-        .select("id, owner, task, status, category")
-        .eq("id", task_id)
-        .execute()
-    )
+    lookup = supabase.table("tasks").select("*").eq("id", task_id).execute()
 
     if not lookup.data:
         return "Task ID not found."
 
     task = lookup.data[0]
 
-    if task["owner"] != owner:
+    if task.get("owner") != owner:
         return f"Task {task_id} does not belong to {DISPLAY_OWNER[owner]}."
 
-    if task["status"] != "open":
-        return f"Task {task_id} is not open and cannot be moved."
+    update_payload = {"category": new_category}
 
-    (
-        supabase.table("tasks")
-        .update({"category": new_category})
-        .eq("id", task_id)
-        .execute()
-    )
+    if new_category == "daily":
+        update_payload["status"] = "open"
+        update_payload["last_completed_date"] = None
 
-    return (
-        f"✅ Task moved\n"
-        f"{task['task']} [Task ID: {task_id}]\n"
-        f"Category → {DISPLAY_CATEGORY[new_category]}"
-    )
+    supabase.table("tasks").update(update_payload).eq("id", task_id).execute()
+
+    return f"✅ Task moved\n{task.get('task')} [Task ID: {task_id}]\nCategory → {DISPLAY_CATEGORY[new_category]}"
 
 
 def clear_daily(owner: str) -> str:
-    daily_tasks = (
+    daily_rows = (
         supabase.table("tasks")
         .select("id")
         .eq("owner", owner)
-        .eq("status", "open")
         .eq("category", "daily")
         .execute()
     )
 
-    rows = daily_tasks.data or []
+    rows = daily_rows.data or []
 
     if not rows:
-        return f"{DISPLAY_OWNER[owner]} has no open Daily tasks."
+        return f"{DISPLAY_OWNER[owner]} has no Daily tasks."
 
-    ids = [row["id"] for row in rows]
+    supabase.table("tasks").update(
+        {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+    ).eq("owner", owner).eq("category", "daily").execute()
 
-    (
-        supabase.table("tasks")
-        .update({"status": "completed", "completed_at": now_utc_iso()})
-        .in_("id", ids)
-        .execute()
-    )
+    return f"✅ Daily tasks cleared\n{len(rows)} task(s) completed for {DISPLAY_OWNER[owner]}"
 
-    return f"✅ Daily tasks cleared\n{len(ids)} task(s) completed for {DISPLAY_OWNER[owner]}"
+
+# -------------------------
+# List helpers
+# -------------------------
+
+def split_sections(tasks: list):
+    high_priority = [t for t in tasks if t.get("category") == "action" and t.get("priority")]
+    overdue = [t for t in tasks if is_overdue(t)]
+    regular_action = [t for t in tasks if t.get("category") == "action" and not t.get("priority") and not is_overdue(t)]
+    daily = [t for t in tasks if t.get("category") == "daily"]
+    long_term = [t for t in tasks if t.get("category") == "long_term"]
+    return high_priority, overdue, regular_action, daily, long_term
 
 
 def get_owner_full_list(owner: str) -> str:
-    tasks = get_tasks(owner, status="open")
-    grouped = group_tasks(tasks)
+    tasks = get_open_visible_tasks(owner)
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
     lines = [f"{DISPLAY_OWNER[owner]} — Punch List", ""]
 
-    priority_action = [t for t in grouped.get("action", []) if t.get("priority")]
-    regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
-    daily = grouped.get("daily", [])
-    long_term = grouped.get("long_term", [])
+    def add_section(title, items, include_age=False):
+        if items:
+            lines.append(f"{title} ({len(items)})")
+            for t in items:
+                lines.append(f"• {format_task_line(t, include_age=include_age)}")
+            lines.append("")
 
-    if priority_action:
-        lines.append(f"High Priority ({len(priority_action)})")
-        for task in priority_action:
-            lines.append(f"• {format_task_line(task)}")
-        lines.append("")
-
-    if regular_action:
-        lines.append(f"Action Items ({len(regular_action)})")
-        for task in regular_action:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if daily:
-        lines.append(f"Daily ({len(daily)})")
-        for task in daily:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if long_term:
-        lines.append(f"LT ({len(long_term)})")
-        for task in long_term:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
+    add_section("High Priority", high_priority)
+    add_section("Overdue", overdue, include_age=True)
+    add_section("Action Items", regular_action)
+    add_section("Daily", daily)
+    add_section("LT", long_term)
 
     if len(lines) == 2:
         return f"{DISPLAY_OWNER[owner]} — Punch List\n\nNo open tasks."
@@ -277,39 +359,23 @@ def get_owner_full_list(owner: str) -> str:
 
 
 def get_owner_today(owner: str) -> str:
-    tasks = get_tasks(owner, status="open")
-    grouped = group_tasks(tasks)
-
-    priority_action = [t for t in grouped.get("action", []) if t.get("priority")]
-    regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
-    daily = grouped.get("daily", [])
-    long_term = grouped.get("long_term", [])
+    tasks = get_open_visible_tasks(owner)
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
     lines = [f"{DISPLAY_OWNER[owner]} — Today", ""]
 
-    if priority_action:
-        lines.append(f"High Priority ({len(priority_action)})")
-        for task in priority_action:
-            lines.append(f"• {format_task_line(task)}")
-        lines.append("")
+    def add_section(title, items, include_age=False):
+        if items:
+            lines.append(f"{title} ({len(items)})")
+            for t in items:
+                lines.append(f"• {format_task_line(t, include_age=include_age)}")
+            lines.append("")
 
-    if daily:
-        lines.append(f"Daily ({len(daily)})")
-        for task in daily:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if regular_action:
-        lines.append(f"Action Items ({len(regular_action)})")
-        for task in regular_action:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
-
-    if long_term:
-        lines.append(f"LT ({len(long_term)})")
-        for task in long_term:
-            lines.append(f"• {format_task_line(task, show_priority=False)}")
-        lines.append("")
+    add_section("High Priority", high_priority)
+    add_section("Overdue", overdue, include_age=True)
+    add_section("Daily", daily)
+    add_section("Action Items", regular_action)
+    add_section("LT", long_term)
 
     if len(lines) == 2:
         return f"{DISPLAY_OWNER[owner]} — Today\n\nNo open tasks."
@@ -318,64 +384,38 @@ def get_owner_today(owner: str) -> str:
 
 
 def get_owner_next(owner: str) -> str:
-    tasks = get_tasks(owner, status="open")
-    action_tasks = [t for t in tasks if t.get("category") == "action"]
+    tasks = get_open_visible_tasks(owner)
+    action_like = [t for t in tasks if t.get("category") == "action"]
 
-    if not action_tasks:
+    if not action_like:
         return f"{DISPLAY_OWNER[owner]} has no open Action Items."
 
-    next_task = action_tasks[0]
-    return f"{DISPLAY_OWNER[owner]} — Next\n\n{format_task_line(next_task)}"
+    next_task = sorted(action_like, key=sort_key)[0]
+    return f"{DISPLAY_OWNER[owner]} — Next\n\n{format_task_line(next_task, include_age=is_overdue(next_task))}"
 
 
 def get_global_next() -> str:
-    all_tasks = []
-    for owner in ["richard", "nick"]:
-        all_tasks.extend(get_tasks(owner, status="open"))
+    tasks = get_open_visible_tasks("richard") + get_open_visible_tasks("nick")
+    action_like = [t for t in tasks if t.get("category") == "action"]
 
-    action_tasks = [t for t in all_tasks if t.get("category") == "action"]
-
-    if not action_tasks:
+    if not action_like:
         return "No open Action Items."
 
-    action_tasks.sort(
-        key=lambda t: (
-            0 if t.get("priority") else 1,
-            t.get("created_at") or "",
-            t.get("id") or 0,
-        )
-    )
-
-    next_task = action_tasks[0]
-    owner_name = DISPLAY_OWNER[next_task["owner"]]
-    return f"Next Task\n\n{owner_name}: {format_task_line(next_task)}"
+    next_task = sorted(action_like, key=sort_key)[0]
+    return f"Next Task\n\n{DISPLAY_OWNER[next_task['owner']]}: {format_task_line(next_task, include_age=is_overdue(next_task))}"
 
 
-def get_completed_since(owner: Optional[str], since_dt: datetime, title: str) -> str:
-    query = (
-        supabase.table("tasks")
-        .select("id, owner, task, completed_at")
-        .eq("status", "completed")
-        .gte("completed_at", since_dt.isoformat())
-        .execute()
-    )
-
-    tasks = query.data or []
-    tasks.sort(key=lambda t: (t.get("owner") or "", t.get("completed_at") or ""))
-
-    if owner:
-        tasks = [t for t in tasks if t["owner"] == owner]
+def get_completed_since_message(since_dt: datetime, title: str, owner: Optional[str] = None) -> str:
+    tasks = get_completed_tasks_since(since_dt, owner=owner)
 
     if not tasks:
-        if owner:
-            return f"{title}\n\nNo completed tasks for {DISPLAY_OWNER[owner]}."
         return f"{title}\n\nNo completed tasks."
 
     lines = [title, ""]
     grouped = defaultdict(list)
 
     for task in tasks:
-        grouped[task["owner"]].append(task)
+        grouped[task.get("owner")].append(task)
 
     for owner_key in ["richard", "nick"]:
         owner_tasks = grouped.get(owner_key, [])
@@ -383,20 +423,28 @@ def get_completed_since(owner: Optional[str], since_dt: datetime, title: str) ->
             continue
         lines.append(DISPLAY_OWNER[owner_key])
         for task in owner_tasks:
-            lines.append(f"✓ {task['task']} [Task ID: {task['id']}]")
+            lines.append(f"✓ {task.get('task')} [Task ID: {task.get('id')}]")
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
-def get_completed_today(owner: str) -> str:
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    return get_completed_since(owner, start, f"{DISPLAY_OWNER[owner]} — Completed Today")
+def get_completed_today_message(owner: str) -> str:
+    start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+    tasks = get_completed_tasks_since(start, owner=owner)
+
+    if not tasks:
+        return f"{DISPLAY_OWNER[owner]} — Completed Today\n\nNo completed tasks."
+
+    lines = [f"{DISPLAY_OWNER[owner]} — Completed Today", ""]
+    for task in tasks:
+        lines.append(f"✓ {task.get('task')} [Task ID: {task.get('id')}]")
+    return "\n".join(lines)
 
 
-def get_wdw() -> str:
-    start = datetime.now(timezone.utc) - timedelta(days=7)
-    return get_completed_since(None, start, "Work Done This Week")
+def get_wdw_message() -> str:
+    start = now_utc() - timedelta(days=7)
+    return get_completed_since_message(start, "Work Done This Week")
 
 
 def get_help_text() -> str:
@@ -422,8 +470,9 @@ R + task            = Add Action Item
 R LT task           = Add LT task
 
 HIGH PRIORITY
-R A ! task          = Add high priority Action Item
+R ! task            = Add high priority Action Item
 R + ! task          = Add high priority Action Item
+R A ! task          = Add high priority Action Item
 
 COMPLETE
 R X 12              = Complete task by ID
@@ -435,13 +484,16 @@ R MOVE 12 ACTION    = Move task to Action Items
 R MOVE 12 LT        = Move task to LT
 
 CLEAR DAILY
-R CLEAR DAILY       = Complete all open Daily tasks
-N CLEAR DAILY       = Complete all open Daily tasks
+R CLEAR DAILY       = Mark today's Daily tasks complete
+N CLEAR DAILY       = Mark today's Daily tasks complete
 
 WEB
 /dashboard          = Full dashboard
 /today              = Today command center
 /focus              = Focus mode
+/completed-today    = Completed today
+/completed-week     = Completed this week
+/command            = Command center
 
 HELP
 HELP / CODES        = Show this guide
@@ -449,7 +501,7 @@ HELP / CODES        = Show this guide
 
 
 # -------------------------
-# SMS Parsing
+# SMS parsing
 # -------------------------
 
 def parse_sms_command(body: str) -> dict:
@@ -471,98 +523,77 @@ def parse_sms_command(body: str) -> dict:
     if lowered == "next":
         return {"type": "global_next"}
 
-    owner_today = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*today", lowered)
-    if owner_today:
-        owner = VALID_OWNERS[owner_today.group(1)]
-        return {"type": "today", "owner": owner}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*today", lowered)
+    if m:
+        return {"type": "today", "owner": VALID_OWNERS[m.group(1)]}
 
-    owner_next = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*next", lowered)
-    if owner_next:
-        owner = VALID_OWNERS[owner_next.group(1)]
-        return {"type": "owner_next", "owner": owner}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*next", lowered)
+    if m:
+        return {"type": "owner_next", "owner": VALID_OWNERS[m.group(1)]}
 
-    owner_done = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*done", lowered)
-    if owner_done:
-        owner = VALID_OWNERS[owner_done.group(1)]
-        return {"type": "done_today", "owner": owner}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*done", lowered)
+    if m:
+        return {"type": "done_today", "owner": VALID_OWNERS[m.group(1)]}
 
-    owner_clear_daily = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*clear\s+daily", lowered)
-    if owner_clear_daily:
-        owner = VALID_OWNERS[owner_clear_daily.group(1)]
-        return {"type": "clear_daily", "owner": owner}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*clear\s+daily", lowered)
+    if m:
+        return {"type": "clear_daily", "owner": VALID_OWNERS[m.group(1)]}
 
-    complete_match = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*x\s+(\d+)", lowered)
-    if complete_match:
-        owner = VALID_OWNERS[complete_match.group(1)]
-        task_id = int(complete_match.group(2))
-        return {"type": "complete", "owner": owner, "task_id": task_id}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*x\s+(\d+)", lowered)
+    if m:
+        return {"type": "complete", "owner": VALID_OWNERS[m.group(1)], "task_id": int(m.group(2))}
 
-    move_match = re.fullmatch(
-        r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm)",
-        lowered,
-    )
-    if move_match:
-        owner = VALID_OWNERS[move_match.group(1)]
-        task_id = int(move_match.group(2))
-        category = VALID_CATEGORIES[move_match.group(3)]
-        return {"type": "move", "owner": owner, "task_id": task_id, "category": category}
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm)", lowered)
+    if m:
+        return {
+            "type": "move",
+            "owner": VALID_OWNERS[m.group(1)],
+            "task_id": int(m.group(2)),
+            "category": VALID_CATEGORIES[m.group(3)],
+        }
 
-    add_plus_match = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+(!)?\s*(.+)", lowered)
-    if add_plus_match:
-        owner = VALID_OWNERS[add_plus_match.group(1)]
-        priority = bool(add_plus_match.group(2))
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+!\s+(.+)", lowered)
+    if m:
+        owner = VALID_OWNERS[m.group(1)]
+        task_text = raw.split("!", 1)[1].strip()
+        return {"type": "add", "owner": owner, "category": "action", "priority": True, "task_text": task_text}
+
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*!\s+(.+)", lowered)
+    if m:
+        owner = VALID_OWNERS[m.group(1)]
+        task_text = raw.split("!", 1)[1].strip()
+        return {"type": "add", "owner": owner, "category": "action", "priority": True, "task_text": task_text}
+
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+(.+)", lowered)
+    if m:
+        owner = VALID_OWNERS[m.group(1)]
         task_text = raw.split("+", 1)[1].strip()
+        return {"type": "add", "owner": owner, "category": "action", "priority": False, "task_text": task_text}
+
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+(!)?\s*(.+)", lowered)
+    if m:
+        owner = VALID_OWNERS[m.group(1)]
+        category = VALID_CATEGORIES[m.group(2)]
+        priority = bool(m.group(3))
+        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+", re.IGNORECASE)
+        task_text = prefix_pattern.sub("", raw, count=1).strip()
+
         if priority and task_text.startswith("!"):
             task_text = task_text[1:].strip()
-        return {
-            "type": "add",
-            "owner": owner,
-            "category": "action",
-            "priority": priority,
-            "task_text": task_text,
-        }
 
-    add_match = re.fullmatch(
-        r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+(!)?\s*(.+)",
-        lowered,
-    )
-    if add_match:
-        owner = VALID_OWNERS[add_match.group(1)]
-        category = VALID_CATEGORIES[add_match.group(2)]
-        priority = bool(add_match.group(3))
-        task_text = raw.split(maxsplit=2)[-1]
+        return {"type": "add", "owner": owner, "category": category, "priority": priority, "task_text": task_text}
 
-        # Clean task text for priority marker
-        if priority:
-            bang_index = task_text.find("!")
-            if bang_index != -1:
-                task_text = task_text[bang_index + 1:].strip()
-
-        return {
-            "type": "add",
-            "owner": owner,
-            "category": category,
-            "priority": priority,
-            "task_text": task_text,
-        }
-
-    legacy_add_match = re.fullmatch(r"(richard|r|nick|n|rn)\s*:\s*(.+)", lowered)
-    if legacy_add_match:
-        owner = VALID_OWNERS[legacy_add_match.group(1)]
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:\s*(.+)", lowered)
+    if m:
+        owner = VALID_OWNERS[m.group(1)]
         task_text = raw.split(":", 1)[1].strip()
-        return {
-            "type": "legacy_add",
-            "owner": owner,
-            "category": "action",
-            "priority": False,
-            "task_text": task_text,
-        }
+        return {"type": "legacy_add", "owner": owner, "category": "action", "priority": False, "task_text": task_text}
 
     return {"type": "unknown"}
 
 
 # -------------------------
-# SMS Endpoint
+# SMS endpoint
 # -------------------------
 
 @app.post("/sms")
@@ -587,10 +618,10 @@ async def sms_reply(request: Request):
         return twiml(get_global_next())
 
     if command["type"] == "done_today":
-        return twiml(get_completed_today(command["owner"]))
+        return twiml(get_completed_today_message(command["owner"]))
 
     if command["type"] == "wdw":
-        return twiml(get_wdw())
+        return twiml(get_wdw_message())
 
     if command["type"] == "complete":
         return twiml(complete_task_by_id(command["owner"], command["task_id"]))
@@ -603,24 +634,17 @@ async def sms_reply(request: Request):
 
     if command["type"] == "add":
         if command["owner"] == "both":
-            result_one = add_task("richard", command["category"], command["task_text"], command["priority"])
-            result_two = add_task("nick", command["category"], command["task_text"], command["priority"])
-            return twiml(f"{result_one}\n\n{result_two}")
+            r1 = add_task("richard", command["category"], command["task_text"], command["priority"])
+            r2 = add_task("nick", command["category"], command["task_text"], command["priority"])
+            return twiml(f"{r1}\n\n{r2}")
 
-        return twiml(
-            add_task(
-                command["owner"],
-                command["category"],
-                command["task_text"],
-                command["priority"],
-            )
-        )
+        return twiml(add_task(command["owner"], command["category"], command["task_text"], command["priority"]))
 
     if command["type"] == "legacy_add":
         if command["owner"] == "both":
-            result_one = add_task("richard", "action", command["task_text"], False)
-            result_two = add_task("nick", "action", command["task_text"], False)
-            return twiml(f"{result_one}\n\n{result_two}")
+            r1 = add_task("richard", "action", command["task_text"], False)
+            r2 = add_task("nick", "action", command["task_text"], False)
+            return twiml(f"{r1}\n\n{r2}")
 
         return twiml(add_task(command["owner"], "action", command["task_text"], False))
 
@@ -628,74 +652,92 @@ async def sms_reply(request: Request):
 
 
 # -------------------------
-# Web Completion Endpoint
+# Web completion endpoint
 # -------------------------
 
 @app.post("/complete/{task_id}")
 def complete_task_web(task_id: int):
-    (
-        supabase.table("tasks")
-        .update({"status": "completed", "completed_at": now_utc_iso()})
-        .eq("id", task_id)
-        .execute()
-    )
+    lookup = supabase.table("tasks").select("*").eq("id", task_id).execute()
+
+    if not lookup.data:
+        return JSONResponse({"success": False, "error": "Task not found"}, status_code=404)
+
+    task = lookup.data[0]
+
+    if (task.get("category") or "action") == "daily":
+        supabase.table("tasks").update(
+            {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+        ).eq("id", task_id).execute()
+    else:
+        supabase.table("tasks").update(
+            {"status": "completed", "completed_at": now_utc_iso()}
+        ).eq("id", task_id).execute()
+
     return JSONResponse({"success": True})
 
 
+@app.get("/favicon.jpg")
+def favicon():
+    if FAVICON_FILE.exists():
+        return FileResponse(FAVICON_FILE, media_type="image/jpeg")
+    return HTMLResponse("", status_code=204)
+
+
 # -------------------------
-# Dashboard Rendering
+# HTML rendering helpers
 # -------------------------
 
-def render_section(title: str, tasks: list, highlight_priority: bool = False) -> str:
+def render_section(title: str, tasks: list, include_age: bool = False) -> str:
     if not tasks:
         return ""
 
-    section_html = f"""
-    <div class="section">
-        <div class="section-title">{escape_text(title)} ({len(tasks)})</div>
-        <div class="task-list">
-    """
+    html_out = f'<div class="section"><div class="section-title">{esc(title)} ({len(tasks)})</div><div class="task-list">'
 
     for task in tasks:
-        flame = '<span class="flame">🔥</span>' if task.get("priority") and highlight_priority else ""
-        section_html += f"""
-            <label class="task-row">
-                <input type="checkbox" onclick="completeTask({task['id']})">
-                <span class="task-text">{flame}{escape_text(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span></span>
-            </label>
-        """
+        prefix = ""
+        if task.get("priority") and task.get("category") == "action":
+            prefix = '<span class="flame">🔥</span>'
+        elif is_overdue(task):
+            prefix = '<span class="warn">⚠</span>'
 
-    section_html += """
-        </div>
-    </div>
-    """
-    return section_html
+        age = f' <span class="age">· {task_age_days(task)}d old</span>' if include_age and task_age_days(task) > 0 else ""
+
+        html_out += f'''
+        <label class="task-row">
+            <input type="checkbox" onclick="completeTask({task['id']})">
+            <span class="task-text">{prefix}{esc(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span>{age}</span>
+        </label>
+        '''
+
+    html_out += "</div></div>"
+    return html_out
 
 
-def render_owner_panel(owner: str, tasks: list) -> str:
-    grouped = group_tasks(tasks)
-    high_priority = [t for t in grouped.get("action", []) if t.get("priority")]
-    regular_action = [t for t in grouped.get("action", []) if not t.get("priority")]
-    daily = grouped.get("daily", [])
-    long_term = grouped.get("long_term", [])
+def render_owner_panel(owner: str, tasks: list, include_long_term: bool = True) -> str:
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
-    return f"""
-    <div class="owner-panel">
-        <h2>{escape_text(DISPLAY_OWNER[owner])}</h2>
-        {render_section("High Priority", high_priority, highlight_priority=True)}
-        {render_section("Action Items", regular_action)}
-        {render_section("Daily", daily)}
-        {render_section("LT", long_term)}
-    </div>
-    """
+    content = [
+        f"<div class='owner-panel'><h2>{esc(DISPLAY_OWNER[owner])}</h2>",
+        render_section("High Priority", high_priority),
+        render_section("Overdue", overdue, include_age=True),
+        render_section("Action Items", regular_action),
+        render_section("Daily", daily),
+    ]
+
+    if include_long_term:
+        content.append(render_section("LT", long_term))
+
+    content.append("</div>")
+    return "".join(content)
 
 
 def base_page(title: str, content: str) -> str:
-    return f"""
+    return f'''
     <html>
     <head>
-        <title>{escape_text(title)}</title>
+        <title>{esc(title)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="icon" type="image/jpeg" href="/favicon.jpg">
         <style>
             body {{
                 font-family: Arial, sans-serif;
@@ -704,7 +746,6 @@ def base_page(title: str, content: str) -> str:
                 color: #111;
                 margin: 0;
             }}
-
             .topbar {{
                 display: flex;
                 justify-content: space-between;
@@ -713,53 +754,44 @@ def base_page(title: str, content: str) -> str:
                 margin-bottom: 22px;
                 flex-wrap: wrap;
             }}
-
             h1 {{
                 margin: 0;
                 font-size: 3rem;
                 line-height: 1.1;
             }}
-
             .meta {{
                 color: #444;
                 font-size: 1rem;
                 text-align: right;
                 line-height: 1.8;
             }}
-
             .meta a {{
                 color: #444;
                 text-decoration: none;
                 margin-left: 14px;
             }}
-
             .meta a:hover {{
                 text-decoration: underline;
             }}
-
             .board {{
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 32px;
             }}
-
-            .owner-panel {{
+            .owner-panel, .summary-card, .focus-card, .stat {{
                 background: #fff;
                 border-radius: 14px;
                 padding: 24px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08);
             }}
-
             h2 {{
                 margin-top: 0;
                 font-size: 2rem;
                 margin-bottom: 24px;
             }}
-
             .section {{
                 margin-bottom: 28px;
             }}
-
             .section-title {{
                 font-size: 1.2rem;
                 font-weight: bold;
@@ -768,13 +800,11 @@ def base_page(title: str, content: str) -> str:
                 border-bottom: 1px solid #ddd;
                 color: #364152;
             }}
-
             .task-list {{
                 display: flex;
                 flex-direction: column;
                 gap: 10px;
             }}
-
             .task-row {{
                 display: flex;
                 align-items: flex-start;
@@ -784,7 +814,6 @@ def base_page(title: str, content: str) -> str:
                 padding: 6px 0;
                 cursor: pointer;
             }}
-
             .task-row input[type="checkbox"] {{
                 width: 22px;
                 height: 22px;
@@ -792,51 +821,56 @@ def base_page(title: str, content: str) -> str:
                 cursor: pointer;
                 flex: 0 0 auto;
             }}
-
             .task-text {{
                 display: inline-block;
             }}
-
             .task-id {{
                 color: #666;
                 font-size: 0.95rem;
             }}
-
-            .flame {{
+            .flame, .warn {{
                 margin-right: 8px;
             }}
-
+            .age {{
+                color: #666;
+                font-size: 0.92rem;
+            }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 18px;
+                margin-bottom: 24px;
+            }}
+            .stat-label {{
+                color: #666;
+                font-size: 0.95rem;
+                margin-bottom: 8px;
+            }}
+            .stat-value {{
+                font-size: 2rem;
+                font-weight: bold;
+            }}
             .focus-board {{
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 24px;
             }}
-
-            .focus-card {{
-                background: #fff;
-                border-radius: 14px;
-                padding: 24px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-            }}
-
             .empty {{
                 color: #666;
                 font-style: italic;
             }}
-
+            @media (max-width: 1100px) {{
+                .stats-grid {{
+                    grid-template-columns: 1fr 1fr;
+                }}
+            }}
             @media (max-width: 900px) {{
-                .board {{
+                .board, .focus-board, .stats-grid {{
                     grid-template-columns: 1fr;
                 }}
-
-                .focus-board {{
-                    grid-template-columns: 1fr;
-                }}
-
                 h1 {{
                     font-size: 2.2rem;
                 }}
-
                 .meta {{
                     text-align: left;
                 }}
@@ -844,13 +878,9 @@ def base_page(title: str, content: str) -> str:
         </style>
         <script>
             function completeTask(id) {{
-                fetch("/complete/" + id, {{
-                    method: "POST"
-                }}).then(() => {{
-                    location.reload();
-                }});
+                fetch("/complete/" + id, {{ method: "POST" }})
+                    .then(() => location.reload());
             }}
-
             setInterval(function() {{
                 location.reload();
             }}, 5000);
@@ -858,21 +888,21 @@ def base_page(title: str, content: str) -> str:
     </head>
     <body>
         <div class="topbar">
-            <div>
-                <h1>{escape_text(title)}</h1>
-            </div>
+            <div><h1>{esc(title)}</h1></div>
             <div class="meta">
-                ✨ Updates every 5 seconds
-                <br>
+                ✨ Updates every 5 seconds<br>
                 <a href="/dashboard">Dashboard</a>
-                <a href="/today">Today Command Center</a>
-                <a href="/focus">Focus Mode</a>
+                <a href="/today">Today</a>
+                <a href="/focus">Focus</a>
+                <a href="/completed-today">Completed Today</a>
+                <a href="/completed-week">Completed Week</a>
+                <a href="/command">Command Center</a>
             </div>
         </div>
         {content}
     </body>
     </html>
-    """
+    '''
 
 
 # -------------------------
@@ -881,79 +911,140 @@ def base_page(title: str, content: str) -> str:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    richard_tasks = get_tasks("richard", status="open")
-    nick_tasks = get_tasks("nick", status="open")
-
-    content = f"""
+    content = f'''
     <div class="board">
-        {render_owner_panel("richard", richard_tasks)}
-        {render_owner_panel("nick", nick_tasks)}
+        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=True)}
+        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=True)}
     </div>
-    """
-
+    '''
     return HTMLResponse(base_page("Briefly Home Punch Lists", content))
 
 
 @app.get("/today", response_class=HTMLResponse)
 def today_page():
-    def render_today_panel(owner: str) -> str:
-        tasks = get_tasks(owner, status="open")
-        grouped = group_tasks(tasks)
-        priority = [t for t in grouped.get("action", []) if t.get("priority")]
-        daily = grouped.get("daily", [])
-        action = [t for t in grouped.get("action", []) if not t.get("priority")]
-
-        return f"""
-        <div class="owner-panel">
-            <h2>{escape_text(DISPLAY_OWNER[owner])}</h2>
-            {render_section("High Priority", priority, highlight_priority=True)}
-            {render_section("Daily", daily)}
-            {render_section("Action Items", action)}
-        </div>
-        """
-
-    content = f"""
+    content = f'''
     <div class="board">
-        {render_today_panel("richard")}
-        {render_today_panel("nick")}
+        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=False)}
+        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=False)}
     </div>
-    """
-
+    '''
     return HTMLResponse(base_page("Briefly Home — Today", content))
 
 
 @app.get("/focus", response_class=HTMLResponse)
 def focus_page():
-    def render_focus_card(owner: str) -> str:
-        tasks = [
-            t for t in get_tasks(owner, status="open")
-            if t.get("priority") and t.get("category") == "action"
-        ]
-
+    def render_focus(owner: str):
+        tasks = [t for t in get_open_visible_tasks(owner) if t.get("priority") or is_overdue(t)]
         if not tasks:
-            task_html = '<div class="empty">No high priority Action Items.</div>'
+            body = '<div class="empty">No high-priority or overdue Action Items.</div>'
         else:
-            task_html = ""
-            for task in tasks:
-                task_html += f"""
-                <label class="task-row">
-                    <input type="checkbox" onclick="completeTask({task['id']})">
-                    <span class="task-text"><span class="flame">🔥</span>{escape_text(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span></span>
-                </label>
-                """
+            body = render_section("Focus", tasks, include_age=True)
+        return f"<div class='focus-card'><h2>{esc(DISPLAY_OWNER[owner])}</h2>{body}</div>"
 
-        return f"""
-        <div class="focus-card">
-            <h2>{escape_text(DISPLAY_OWNER[owner])}</h2>
-            {task_html}
-        </div>
-        """
-
-    content = f"""
+    content = f'''
     <div class="focus-board">
-        {render_focus_card("richard")}
-        {render_focus_card("nick")}
+        {render_focus("richard")}
+        {render_focus("nick")}
     </div>
-    """
-
+    '''
     return HTMLResponse(base_page("Briefly Home — Focus Mode", content))
+
+
+def render_completed_page(title: str, since_dt: datetime):
+    tasks = get_completed_tasks_since(since_dt)
+    grouped = defaultdict(list)
+
+    for task in tasks:
+        grouped[task.get("owner")].append(task)
+
+    def section_for(owner: str):
+        owner_tasks = grouped.get(owner, [])
+        if not owner_tasks:
+            return f"<div class='owner-panel'><h2>{esc(DISPLAY_OWNER[owner])}</h2><div class='empty'>No completed tasks.</div></div>"
+
+        task_html = "<div class='task-list'>"
+        for task in owner_tasks:
+            task_html += f"<div class='task-row'><span class='task-text'>{esc(task.get('task'))} <span class='task-id'>[Task ID: {task.get('id')}]</span></span></div>"
+        task_html += "</div>"
+
+        return f"<div class='owner-panel'><h2>{esc(DISPLAY_OWNER[owner])}</h2>{task_html}</div>"
+
+    content = f'''
+    <div class="board">
+        {section_for("richard")}
+        {section_for("nick")}
+    </div>
+    '''
+    return HTMLResponse(base_page(title, content))
+
+
+@app.get("/completed-today", response_class=HTMLResponse)
+def completed_today_page():
+    start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+    return render_completed_page("Completed Today", start)
+
+
+@app.get("/completed-week", response_class=HTMLResponse)
+def completed_week_page():
+    start = now_utc() - timedelta(days=7)
+    return render_completed_page("Completed This Week", start)
+
+
+@app.get("/command", response_class=HTMLResponse)
+def command_center():
+    r_open = get_open_visible_tasks("richard")
+    n_open = get_open_visible_tasks("nick")
+    all_open = r_open + n_open
+
+    high_priority = [t for t in all_open if t.get("priority") and t.get("category") == "action"]
+    overdue = [t for t in all_open if is_overdue(t)]
+
+    r_daily_remaining = len([t for t in r_open if t.get("category") == "daily"])
+    n_daily_remaining = len([t for t in n_open if t.get("category") == "daily"])
+    r_action_open = len([t for t in r_open if t.get("category") == "action"])
+    n_action_open = len([t for t in n_open if t.get("category") == "action"])
+
+    today_start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now_utc() - timedelta(days=7)
+
+    completed_today = get_completed_tasks_since(today_start)
+    completed_week = get_completed_tasks_since(week_start)
+
+    r_completed_today = len([t for t in completed_today if t.get("owner") == "richard"])
+    n_completed_today = len([t for t in completed_today if t.get("owner") == "nick"])
+    r_completed_week = len([t for t in completed_week if t.get("owner") == "richard"])
+    n_completed_week = len([t for t in completed_week if t.get("owner") == "nick"])
+
+    def simple_task_block(title: str, tasks: list, include_age: bool = False):
+        if not tasks:
+            return f"<div class='summary-card'><h2>{esc(title)}</h2><div class='empty'>None.</div></div>"
+
+        html_out = f"<div class='summary-card'><h2>{esc(title)}</h2><div class='task-list'>"
+        for task in tasks:
+            prefix = "🔥 " if task.get("priority") else "⚠ " if is_overdue(task) else ""
+            age = f" · {task_age_days(task)}d old" if include_age and task_age_days(task) > 0 else ""
+            html_out += f"<div class='task-row'><span class='task-text'>{prefix}{esc(task.get('task'))} <span class='task-id'>[Task ID: {task.get('id')}]</span>{age}</span></div>"
+        html_out += "</div></div>"
+        return html_out
+
+    stats = f'''
+    <div class="stats-grid">
+        <div class="stat"><div class="stat-label">Richard Daily Remaining</div><div class="stat-value">{r_daily_remaining}</div></div>
+        <div class="stat"><div class="stat-label">Nick Daily Remaining</div><div class="stat-value">{n_daily_remaining}</div></div>
+        <div class="stat"><div class="stat-label">Richard Action Open</div><div class="stat-value">{r_action_open}</div></div>
+        <div class="stat"><div class="stat-label">Nick Action Open</div><div class="stat-value">{n_action_open}</div></div>
+        <div class="stat"><div class="stat-label">Richard Completed Today</div><div class="stat-value">{r_completed_today}</div></div>
+        <div class="stat"><div class="stat-label">Nick Completed Today</div><div class="stat-value">{n_completed_today}</div></div>
+        <div class="stat"><div class="stat-label">Richard Completed Week</div><div class="stat-value">{r_completed_week}</div></div>
+        <div class="stat"><div class="stat-label">Nick Completed Week</div><div class="stat-value">{n_completed_week}</div></div>
+    </div>
+    '''
+
+    content = stats + f'''
+    <div class="board">
+        {simple_task_block("High Priority Issues", high_priority)}
+        {simple_task_block("Overdue Tasks", overdue, include_age=True)}
+    </div>
+    '''
+
+    return HTMLResponse(base_page("Briefly Home — Command Center", content))
