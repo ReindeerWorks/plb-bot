@@ -1,228 +1,269 @@
-from fastapi import FastAPI, Form
-from fastapi.responses import Response
-from twilio.twiml.messaging_response import MessagingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from supabase import create_client
+from twilio.twiml.messaging_response import MessagingResponse
 import os
-from datetime import datetime, timedelta
-import re
 
 app = FastAPI()
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def normalize_command(text):
-    text = text.strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
+# ---------------------------
+# Utility: Twilio Response
+# ---------------------------
+
+def twiml(message):
+    resp = MessagingResponse()
+    resp.message(message)
+    return HTMLResponse(str(resp), media_type="application/xml")
 
 
-def get_help():
+# ---------------------------
+# Add Task
+# ---------------------------
 
-    message = (
-        "Punch List Bot Commands\n\n"
+def add_task(owner, task):
 
-        "LISTS\n"
-        "R?  → Richard Daily + Action tasks\n"
-        "N?  → Nick Daily + Action tasks\n"
-        "NEXT → Next steps list\n\n"
+    supabase.table("tasks").insert({
+        "owner": owner,
+        "category": "action",
+        "task": task,
+        "status": "open"
+    }).execute()
 
-        "TASK MANAGEMENT\n"
-        "R: task → Add task to Richard\n"
-        "N: task → Add task to Nick\n"
-        "R: X # → Complete Richard task\n"
-        "N: X # → Complete Nick task\n\n"
-
-        "REPORTS\n"
-        "WDW → Work Done This Week\n\n"
-
-        "HELP\n"
-        "HELP / CODES → Show this guide"
-    )
-
-    return message
+    return f"✅ Task added\n{owner.capitalize()}: {task}"
 
 
-def get_punch_list(owner):
+# ---------------------------
+# Get Today View
+# ---------------------------
 
-    response = supabase.table("tasks") \
-        .select("id,category,task") \
+def get_today(owner):
+
+    daily = supabase.table("tasks") \
+        .select("*") \
         .eq("owner", owner) \
+        .eq("category", "daily") \
         .eq("status", "open") \
         .execute()
 
-    daily = []
-    action = []
-
-    for row in response.data:
-
-        line = f"{row['id']} {row['task']}"
-
-        if row["category"] == "daily":
-            daily.append(line)
-
-        elif row["category"] == "action":
-            action.append(line)
-
-    message = f"{owner} — Punch List\n\n"
-
-    if daily:
-        message += "Daily\n"
-        message += "\n".join(daily)
-        message += "\n\n"
-
-    if action:
-        message += "Action\n"
-        message += "\n".join(action)
-
-    return message
-
-
-def get_next_steps():
-
-    response = supabase.table("tasks") \
-        .select("id,owner,task,category") \
+    action = supabase.table("tasks") \
+        .select("*") \
+        .eq("owner", owner) \
+        .eq("category", "action") \
         .eq("status", "open") \
         .execute()
 
-    message = "Next Steps\n\n"
+    msg = f"{owner.upper()} — TODAY\n\n"
 
-    for row in response.data:
+    if daily.data:
+        msg += "DAILY\n"
+        for i, t in enumerate(daily.data, start=1):
+            msg += f"{i}) {t['task']}\n"
 
-        if row["category"] in ["daily", "action"]:
-            message += f"{row['owner']} {row['id']} {row['task']}\n"
+    if action.data:
+        msg += "\nNEXT ACTION\n"
+        msg += action.data[0]["task"]
 
-    return message
+    return msg
 
 
-def get_wdw():
+# ---------------------------
+# Get Next Task
+# ---------------------------
 
-    week_start = datetime.utcnow() - timedelta(days=7)
+def get_next():
 
-    response = supabase.table("tasks") \
-        .select("owner,task") \
-        .eq("status", "completed") \
-        .gte("completed_at", week_start.isoformat()) \
+    action = supabase.table("tasks") \
+        .select("*") \
+        .eq("category", "action") \
+        .eq("status", "open") \
+        .limit(1) \
         .execute()
 
-    richard = []
-    nick = []
+    if action.data:
+        return f"NEXT TASK\n{action.data[0]['task']}"
 
-    for row in response.data:
+    return "No open tasks."
 
-        if row["owner"] == "Richard":
-            richard.append(f"✔ {row['task']}")
 
-        if row["owner"] == "Nick":
-            nick.append(f"✔ {row['task']}")
+# ---------------------------
+# Help Command
+# ---------------------------
 
-    message = "Work Done This Week\n\n"
+def help_text():
 
-    if richard:
-        message += "Richard\n"
-        message += "\n".join(richard)
-        message += "\n\n"
+    return """
+PLB COMMANDS
 
-    if nick:
-        message += "Nick\n"
-        message += "\n".join(nick)
+ADD TASK
+R: task → add task to Richard
+N: task → add task to Nick
+RN: task → add to both
 
-    return message
+TODAY
+r today
+n today
 
+NEXT TASK
+next
+
+REPORTING
+wdw → tasks completed this week
+wlm → last week completed
+wdm → month completed
+
+SYSTEM
+help / codes → show commands
+"""
+
+
+# ---------------------------
+# SMS Endpoint
+# ---------------------------
 
 @app.post("/sms")
-async def sms(Body: str = Form(...)):
+async def sms_reply(request: Request):
 
-    body = normalize_command(Body)
-    body_upper = body.upper()
+    form = await request.form()
+    body = form.get("Body", "")
 
-    resp = MessagingResponse()
+    msg = body.lower().strip()
 
-    # HELP / CODES
-    if body_upper in ["HELP", "CODES", "COMMANDS"]:
-        resp.message(get_help())
-        return Response(str(resp), media_type="application/xml")
 
-    # R?
-    if re.match(r"^R\s*\?$", body_upper):
-        resp.message(get_punch_list("Richard"))
-        return Response(str(resp), media_type="application/xml")
+    # HELP
 
-    # N?
-    if re.match(r"^N\s*\?$", body_upper):
-        resp.message(get_punch_list("Nick"))
-        return Response(str(resp), media_type="application/xml")
+    if msg in ["help", "codes"]:
+        return twiml(help_text())
+
+
+    # TODAY
+
+    if "today" in msg:
+
+        if msg.startswith("r") or "richard" in msg:
+            return twiml(get_today("richard"))
+
+        if msg.startswith("n") or "nick" in msg:
+            return twiml(get_today("nick"))
+
 
     # NEXT
-    if body_upper == "NEXT":
-        resp.message(get_next_steps())
-        return Response(str(resp), media_type="application/xml")
 
-    # WDW
-    if body_upper == "WDW":
-        resp.message(get_wdw())
-        return Response(str(resp), media_type="application/xml")
+    if msg == "next":
+        return twiml(get_next())
 
-    # ADD OR COMPLETE TASKS
 
-    if re.match(r"^R\s*:", body_upper):
+    # ADD TASK RICHARD
 
-        task_text = body.split(":", 1)[1].strip()
+    if msg.startswith("r:") or msg.startswith("richard:"):
 
-        if task_text.upper().startswith("X"):
+        task = body.split(":",1)[1].strip()
+        return twiml(add_task("richard", task))
 
-            task_id = task_text[1:].strip()
 
-            supabase.table("tasks") \
-                .update({
-                    "status": "completed",
-                    "completed_at": datetime.utcnow().isoformat()
-                }) \
-                .eq("id", task_id) \
-                .execute()
+    # ADD TASK NICK
 
-            resp.message("✔ Richard task completed")
-            return Response(str(resp), media_type="application/xml")
+    if msg.startswith("n:") or msg.startswith("nick:"):
 
-        supabase.table("tasks").insert({
-            "owner": "Richard",
-            "task": task_text,
-            "category": "action"
-        }).execute()
+        task = body.split(":",1)[1].strip()
+        return twiml(add_task("nick", task))
 
-        resp.message("✔ Task added for Richard")
-        return Response(str(resp), media_type="application/xml")
 
-    if re.match(r"^N\s*:", body_upper):
+    # ADD TASK BOTH
 
-        task_text = body.split(":", 1)[1].strip()
+    if msg.startswith("rn:"):
 
-        if task_text.upper().startswith("X"):
+        task = body.split(":",1)[1].strip()
 
-            task_id = task_text[1:].strip()
+        supabase.table("tasks").insert([
+            {"owner":"richard","category":"action","task":task,"status":"open"},
+            {"owner":"nick","category":"action","task":task,"status":"open"}
+        ]).execute()
 
-            supabase.table("tasks") \
-                .update({
-                    "status": "completed",
-                    "completed_at": datetime.utcnow().isoformat()
-                }) \
-                .eq("id", task_id) \
-                .execute()
+        return twiml(f"✅ Task added to both\n{task}")
 
-            resp.message("✔ Nick task completed")
-            return Response(str(resp), media_type="application/xml")
 
-        supabase.table("tasks").insert({
-            "owner": "Nick",
-            "task": task_text,
-            "category": "action"
-        }).execute()
+    return twiml("Command not recognized. Text HELP.")
 
-        resp.message("✔ Task added for Nick")
-        return Response(str(resp), media_type="application/xml")
 
-    resp.message("Unknown command. Text HELP for command list.")
-    return Response(str(resp), media_type="application/xml")
+# ---------------------------
+# Dashboard Webpage
+# ---------------------------
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+
+    richard = supabase.table("tasks") \
+        .eq("status","open") \
+        .execute().data
+
+    nick = supabase.table("tasks") \
+        .select("*") \
+        .eq("owner","nick") \
+        .eq("status","open") \
+
+        .execute().data
+
+
+    def render(owner, tasks):
+
+        html = f"<h2>{owner}</h2><ul>"
+
+
+        for t in tasks:
+            html += f"<li><b>{t['category']}</b>: {t['task']}</li>"
+
+        html += "</ul>"
+        return html
+
+
+    page = f"""
+    <html>
+
+    <head>
+
+    <title>Punch List Dashboard</title>
+
+    <style>
+
+    body {{
+        font-family: Arial;
+        padding:40px;
+        background:#f7f7f7
+    }}
+
+    h1 {{
+        margin-bottom:30px
+    }}
+
+    h2 {{
+        margin-top:40px
+    }}
+
+    li {{
+        margin:6px 0
+    }}
+
+    </style>
+
+    </head>
+
+    <body>
+
+    <h1>Briefly Home Punch Lists</h1>
+
+    {render("Richard", richard)}
+
+    {render("Nick", nick)}
+
+    </body>
+
+    </html>
+    """
+
+    return page
