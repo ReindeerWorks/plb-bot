@@ -45,7 +45,6 @@ def parse_command(text):
 
     return {"type": "unknown"}
 
-
 @app.post("/sms")
 async def sms_reply(Body: str = Form(...)):
 
@@ -106,8 +105,4 @@ async def sms_reply(Body: str = Form(...)):
 
         resp.message("Command not recognized.")
 
-    return Response(
-    	content=str(resp),
-	media_type="application/xml",
-	headers={"Content-Type": "text/xml"}
-    )
+    return str(resp)
