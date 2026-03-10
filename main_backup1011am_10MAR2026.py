@@ -38,18 +38,14 @@ VALID_CATEGORIES = {
     "l": "long_term",
     "long_term": "long_term",
     "longterm": "long_term",
-    "u": "update",
-    "update": "update",
-    "updates": "update",
 }
 DISPLAY_CATEGORY = {
     "daily": "Daily",
     "action": "Action Items",
     "long_term": "LT",
-    "update": "Updates",
 }
 
-FAVICON_FILE = Path("BH BOT.jpg")
+FAVICON_FILE = Path("robot.jpg")
 
 
 # -------------------------
@@ -98,16 +94,6 @@ def parse_date_safe(value) -> Optional[date]:
             return None
 
 
-def format_time_short(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%-I:%M %p UTC")
-    except Exception:
-        return ""
-
-
 def is_daily_completed_today(task: dict) -> bool:
     if task.get("category") != "daily":
         return False
@@ -148,10 +134,8 @@ def sort_key(task: dict):
         bucket = 3
     elif category == "long_term":
         bucket = 4
-    elif category == "update":
-        bucket = 5
     else:
-        bucket = 6
+        bucket = 5
     return (bucket, -(task_age_days(task)), str(task.get("created_at") or ""), int(task.get("id") or 0))
 
 
@@ -161,15 +145,8 @@ def format_task_line(task: dict, include_age: bool = False) -> str:
         prefix = "🔥 "
     elif is_overdue(task):
         prefix = "⚠ "
-
-    time_part = ""
-    if task.get("category") == "update":
-        ts = format_time_short(task.get("created_at"))
-        if ts:
-            time_part = f" — {ts}"
-
     age_text = f" · {task_age_days(task)}d old" if include_age and task_age_days(task) > 0 else ""
-    return f"{prefix}{task.get('task', '')}{time_part} [Task ID: {task.get('id')}]{age_text}"
+    return f"{prefix}{task.get('task', '')} [Task ID: {task.get('id')}]{age_text}"
 
 
 # -------------------------
@@ -184,7 +161,6 @@ def get_owner_rows(owner: str) -> list:
 def get_open_visible_tasks(owner: str) -> list:
     rows = get_owner_rows(owner)
     visible = []
-
     for task in rows:
         category = task.get("category") or "action"
         status = task.get("status") or "open"
@@ -259,7 +235,7 @@ def add_task(owner: str, category: str, task_text: str, priority: bool = False) 
         "category": category,
         "task": task_text,
         "status": "open",
-        "priority": priority if category == "action" else False,
+        "priority": priority,
     }
 
     if category == "daily":
@@ -317,10 +293,6 @@ def move_task_by_id(owner: str, task_id: int, new_category: str) -> str:
     if new_category == "daily":
         update_payload["status"] = "open"
         update_payload["last_completed_date"] = None
-        update_payload["priority"] = False
-
-    if new_category != "action":
-        update_payload["priority"] = False
 
     supabase.table("tasks").update(update_payload).eq("id", task_id).execute()
 
@@ -358,14 +330,12 @@ def split_sections(tasks: list):
     regular_action = [t for t in tasks if t.get("category") == "action" and not t.get("priority") and not is_overdue(t)]
     daily = [t for t in tasks if t.get("category") == "daily"]
     long_term = [t for t in tasks if t.get("category") == "long_term"]
-    updates = [t for t in tasks if t.get("category") == "update"]
-    updates.sort(key=lambda t: str(t.get("created_at") or ""), reverse=True)
-    return high_priority, overdue, regular_action, daily, long_term, updates
+    return high_priority, overdue, regular_action, daily, long_term
 
 
 def get_owner_full_list(owner: str) -> str:
     tasks = get_open_visible_tasks(owner)
-    high_priority, overdue, regular_action, daily, long_term, updates = split_sections(tasks)
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
     lines = [f"{DISPLAY_OWNER[owner]} — Punch List", ""]
 
@@ -381,7 +351,6 @@ def get_owner_full_list(owner: str) -> str:
     add_section("Action Items", regular_action)
     add_section("Daily", daily)
     add_section("LT", long_term)
-    add_section("Updates", updates)
 
     if len(lines) == 2:
         return f"{DISPLAY_OWNER[owner]} — Punch List\n\nNo open tasks."
@@ -391,7 +360,7 @@ def get_owner_full_list(owner: str) -> str:
 
 def get_owner_today(owner: str) -> str:
     tasks = get_open_visible_tasks(owner)
-    high_priority, overdue, regular_action, daily, long_term, updates = split_sections(tasks)
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
     lines = [f"{DISPLAY_OWNER[owner]} — Today", ""]
 
@@ -407,7 +376,6 @@ def get_owner_today(owner: str) -> str:
     add_section("Daily", daily)
     add_section("Action Items", regular_action)
     add_section("LT", long_term)
-    add_section("Updates", updates)
 
     if len(lines) == 2:
         return f"{DISPLAY_OWNER[owner]} — Today\n\nNo open tasks."
@@ -455,7 +423,7 @@ def get_completed_since_message(since_dt: datetime, title: str, owner: Optional[
             continue
         lines.append(DISPLAY_OWNER[owner_key])
         for task in owner_tasks:
-            lines.append(f"✓ {format_task_line(task)}")
+            lines.append(f"✓ {task.get('task')} [Task ID: {task.get('id')}]")
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -470,7 +438,7 @@ def get_completed_today_message(owner: str) -> str:
 
     lines = [f"{DISPLAY_OWNER[owner]} — Completed Today", ""]
     for task in tasks:
-        lines.append(f"✓ {format_task_line(task)}")
+        lines.append(f"✓ {task.get('task')} [Task ID: {task.get('id')}]")
     return "\n".join(lines)
 
 
@@ -500,7 +468,6 @@ R D task            = Add Daily task
 R A task            = Add Action Item
 R + task            = Add Action Item
 R LT task           = Add LT task
-R U update text     = Add Update
 
 HIGH PRIORITY
 R ! task            = Add high priority Action Item
@@ -515,7 +482,6 @@ MOVE
 R MOVE 12 DAILY     = Move task to Daily
 R MOVE 12 ACTION    = Move task to Action Items
 R MOVE 12 LT        = Move task to LT
-R MOVE 12 UPDATE    = Move task to Updates
 
 CLEAR DAILY
 R CLEAR DAILY       = Mark today's Daily tasks complete
@@ -577,7 +543,7 @@ def parse_sms_command(body: str) -> dict:
     if m:
         return {"type": "complete", "owner": VALID_OWNERS[m.group(1)], "task_id": int(m.group(2))}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)", lowered)
+    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm)", lowered)
     if m:
         return {
             "type": "move",
@@ -585,13 +551,6 @@ def parse_sms_command(body: str) -> dict:
             "task_id": int(m.group(2)),
             "category": VALID_CATEGORIES[m.group(3)],
         }
-
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*u\s+(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s*u\s+", re.IGNORECASE)
-        task_text = prefix_pattern.sub("", raw, count=1).strip()
-        return {"type": "add", "owner": owner, "category": "update", "priority": False, "task_text": task_text}
 
     m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+!\s+(.+)", lowered)
     if m:
@@ -611,12 +570,12 @@ def parse_sms_command(body: str) -> dict:
         task_text = raw.split("+", 1)[1].strip()
         return {"type": "add", "owner": owner, "category": "action", "priority": False, "task_text": task_text}
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)\s+(!)?\s*(.+)", lowered)
+    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+(!)?\s*(.+)", lowered)
     if m:
         owner = VALID_OWNERS[m.group(1)]
         category = VALID_CATEGORIES[m.group(2)]
-        priority = bool(m.group(3)) and category == "action"
-        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)\s+", re.IGNORECASE)
+        priority = bool(m.group(3))
+        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm)\s+", re.IGNORECASE)
         task_text = prefix_pattern.sub("", raw, count=1).strip()
 
         if priority and task_text.startswith("!"):
@@ -754,8 +713,8 @@ def render_section(title: str, tasks: list, include_age: bool = False) -> str:
     return html_out
 
 
-def render_owner_panel(owner: str, tasks: list, include_long_term: bool = True, include_updates: bool = True) -> str:
-    high_priority, overdue, regular_action, daily, long_term, updates = split_sections(tasks)
+def render_owner_panel(owner: str, tasks: list, include_long_term: bool = True) -> str:
+    high_priority, overdue, regular_action, daily, long_term = split_sections(tasks)
 
     content = [
         f"<div class='owner-panel'><h2>{esc(DISPLAY_OWNER[owner])}</h2>",
@@ -767,9 +726,6 @@ def render_owner_panel(owner: str, tasks: list, include_long_term: bool = True, 
 
     if include_long_term:
         content.append(render_section("LT", long_term))
-
-    if include_updates:
-        content.append(render_section("Updates", updates))
 
     content.append("</div>")
     return "".join(content)
@@ -957,8 +913,8 @@ def base_page(title: str, content: str) -> str:
 def dashboard():
     content = f'''
     <div class="board">
-        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=True, include_updates=True)}
-        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=True, include_updates=True)}
+        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=True)}
+        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=True)}
     </div>
     '''
     return HTMLResponse(base_page("Briefly Home Punch Lists", content))
@@ -968,8 +924,8 @@ def dashboard():
 def today_page():
     content = f'''
     <div class="board">
-        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=False, include_updates=True)}
-        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=False, include_updates=True)}
+        {render_owner_panel("richard", get_open_visible_tasks("richard"), include_long_term=False)}
+        {render_owner_panel("nick", get_open_visible_tasks("nick"), include_long_term=False)}
     </div>
     '''
     return HTMLResponse(base_page("Briefly Home — Today", content))
@@ -1008,7 +964,7 @@ def render_completed_page(title: str, since_dt: datetime):
 
         task_html = "<div class='task-list'>"
         for task in owner_tasks:
-            task_html += f"<div class='task-row'><span class='task-text'>{esc(format_task_line(task))}</span></div>"
+            task_html += f"<div class='task-row'><span class='task-text'>{esc(task.get('task'))} <span class='task-id'>[Task ID: {task.get('id')}]</span></span></div>"
         task_html += "</div>"
 
         return f"<div class='owner-panel'><h2>{esc(DISPLAY_OWNER[owner])}</h2>{task_html}</div>"
@@ -1047,8 +1003,6 @@ def command_center():
     n_daily_remaining = len([t for t in n_open if t.get("category") == "daily"])
     r_action_open = len([t for t in r_open if t.get("category") == "action"])
     n_action_open = len([t for t in n_open if t.get("category") == "action"])
-    r_updates_open = len([t for t in r_open if t.get("category") == "update"])
-    n_updates_open = len([t for t in n_open if t.get("category") == "update"])
 
     today_start = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now_utc() - timedelta(days=7)
@@ -1067,7 +1021,9 @@ def command_center():
 
         html_out = f"<div class='summary-card'><h2>{esc(title)}</h2><div class='task-list'>"
         for task in tasks:
-            html_out += f"<div class='task-row'><span class='task-text'>{esc(format_task_line(task, include_age=include_age))}</span></div>"
+            prefix = "🔥 " if task.get("priority") else "⚠ " if is_overdue(task) else ""
+            age = f" · {task_age_days(task)}d old" if include_age and task_age_days(task) > 0 else ""
+            html_out += f"<div class='task-row'><span class='task-text'>{prefix}{esc(task.get('task'))} <span class='task-id'>[Task ID: {task.get('id')}]</span>{age}</span></div>"
         html_out += "</div></div>"
         return html_out
 
@@ -1077,8 +1033,6 @@ def command_center():
         <div class="stat"><div class="stat-label">Nick Daily Remaining</div><div class="stat-value">{n_daily_remaining}</div></div>
         <div class="stat"><div class="stat-label">Richard Action Open</div><div class="stat-value">{r_action_open}</div></div>
         <div class="stat"><div class="stat-label">Nick Action Open</div><div class="stat-value">{n_action_open}</div></div>
-        <div class="stat"><div class="stat-label">Richard Updates Open</div><div class="stat-value">{r_updates_open}</div></div>
-        <div class="stat"><div class="stat-label">Nick Updates Open</div><div class="stat-value">{n_updates_open}</div></div>
         <div class="stat"><div class="stat-label">Richard Completed Today</div><div class="stat-value">{r_completed_today}</div></div>
         <div class="stat"><div class="stat-label">Nick Completed Today</div><div class="stat-value">{n_completed_today}</div></div>
         <div class="stat"><div class="stat-label">Richard Completed Week</div><div class="stat-value">{r_completed_week}</div></div>
