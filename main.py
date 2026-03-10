@@ -20,7 +20,11 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-DISPLAY_OWNER = {"richard": "Richard", "nick": "Nick"}
+DISPLAY_OWNER = {
+    "richard": "Richard",
+    "nick": "Nick",
+}
+
 VALID_OWNERS = {
     "r": "richard",
     "richard": "richard",
@@ -29,6 +33,7 @@ VALID_OWNERS = {
     "rn": "both",
     "both": "both",
 }
+
 VALID_CATEGORIES = {
     "d": "daily",
     "daily": "daily",
@@ -42,6 +47,7 @@ VALID_CATEGORIES = {
     "update": "update",
     "updates": "update",
 }
+
 DISPLAY_CATEGORY = {
     "daily": "Daily",
     "action": "Action Items",
@@ -85,10 +91,13 @@ def esc(text: str) -> str:
 def parse_date_safe(value) -> Optional[date]:
     if not value:
         return None
+
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
+
     if isinstance(value, datetime):
         return value.date()
+
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
     except Exception:
@@ -101,6 +110,7 @@ def parse_date_safe(value) -> Optional[date]:
 def format_time_short(value: str) -> str:
     if not value:
         return ""
+
     try:
         dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return dt.astimezone(timezone.utc).strftime("%-I:%M %p UTC")
@@ -118,6 +128,7 @@ def task_age_days(task: dict) -> int:
     created = task.get("created_at")
     if not created:
         return 0
+
     try:
         created_dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
         if created_dt.tzinfo is None:
@@ -138,6 +149,7 @@ def is_overdue(task: dict) -> bool:
 
 def sort_key(task: dict):
     category = task.get("category") or "action"
+
     if task.get("priority") and category == "action":
         bucket = 0
     elif is_overdue(task):
@@ -152,11 +164,18 @@ def sort_key(task: dict):
         bucket = 5
     else:
         bucket = 6
-    return (bucket, -(task_age_days(task)), str(task.get("created_at") or ""), int(task.get("id") or 0))
+
+    return (
+        bucket,
+        -(task_age_days(task)),
+        str(task.get("created_at") or ""),
+        int(task.get("id") or 0),
+    )
 
 
 def format_task_line(task: dict, include_age: bool = False) -> str:
     prefix = ""
+
     if task.get("priority") and task.get("category") == "action":
         prefix = "🔥 "
     elif is_overdue(task):
@@ -168,7 +187,10 @@ def format_task_line(task: dict, include_age: bool = False) -> str:
         if ts:
             time_part = f" — {ts}"
 
-    age_text = f" · {task_age_days(task)}d old" if include_age and task_age_days(task) > 0 else ""
+    age_text = ""
+    if include_age and task_age_days(task) > 0:
+        age_text = f" · {task_age_days(task)}d old"
+
     return f"{prefix}{task.get('task', '')}{time_part} [Task ID: {task.get('id')}]{age_text}"
 
 
@@ -286,7 +308,11 @@ def complete_task_by_id(owner: str, task_id: int) -> str:
 
     if category == "daily":
         supabase.table("tasks").update(
-            {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+            {
+                "last_completed_date": str(today_utc()),
+                "completed_at": now_utc_iso(),
+                "status": "open",
+            }
         ).eq("id", task_id).execute()
 
         return f"✅ Daily task completed for today\n{task.get('task')} [Task ID: {task_id}]"
@@ -295,7 +321,10 @@ def complete_task_by_id(owner: str, task_id: int) -> str:
         return f"Task {task_id} is already completed."
 
     supabase.table("tasks").update(
-        {"status": "completed", "completed_at": now_utc_iso()}
+        {
+            "status": "completed",
+            "completed_at": now_utc_iso(),
+        }
     ).eq("id", task_id).execute()
 
     return f"✅ Completed\n{task.get('task')} [Task ID: {task_id}]"
@@ -342,7 +371,11 @@ def clear_daily(owner: str) -> str:
         return f"{DISPLAY_OWNER[owner]} has no Daily tasks."
 
     supabase.table("tasks").update(
-        {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+        {
+            "last_completed_date": str(today_utc()),
+            "completed_at": now_utc_iso(),
+            "status": "open",
+        }
     ).eq("owner", owner).eq("category", "daily").execute()
 
     return f"✅ Daily tasks cleared\n{len(rows)} task(s) completed for {DISPLAY_OWNER[owner]}"
@@ -359,7 +392,9 @@ def split_sections(tasks: list):
     daily = [t for t in tasks if t.get("category") == "daily"]
     long_term = [t for t in tasks if t.get("category") == "long_term"]
     updates = [t for t in tasks if t.get("category") == "update"]
+
     updates.sort(key=lambda t: str(t.get("created_at") or ""), reverse=True)
+
     return high_priority, overdue, regular_action, daily, long_term, updates
 
 
@@ -501,6 +536,8 @@ R A task            = Add Action Item
 R + task            = Add Action Item
 R LT task           = Add LT task
 R U update text     = Add Update
+R UPDATE text       = Add Update
+R + U text          = Add Update
 
 HIGH PRIORITY
 R ! task            = Add high priority Action Item
@@ -535,7 +572,7 @@ HELP / CODES        = Show this guide
 
 
 # -------------------------
-# SMS parsing
+# Token-based SMS parser
 # -------------------------
 
 def parse_sms_command(body: str) -> dict:
@@ -545,92 +582,157 @@ def parse_sms_command(body: str) -> dict:
     if lowered in {"help", "codes", "commands"}:
         return {"type": "help"}
 
-    if re.fullmatch(r"r\s*\?", lowered):
-        return {"type": "full_list", "owner": "richard"}
-
-    if re.fullmatch(r"n\s*\?", lowered):
-        return {"type": "full_list", "owner": "nick"}
-
     if lowered == "wdw":
         return {"type": "wdw"}
 
     if lowered == "next":
         return {"type": "global_next"}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*today", lowered)
-    if m:
-        return {"type": "today", "owner": VALID_OWNERS[m.group(1)]}
+    if re.fullmatch(r"(r|n)\s*\?", lowered):
+        owner = "richard" if lowered.startswith("r") else "nick"
+        return {"type": "full_list", "owner": owner}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*next", lowered)
-    if m:
-        return {"type": "owner_next", "owner": VALID_OWNERS[m.group(1)]}
+    owner_match = re.match(r"^(richard|r|nick|n|rn|both)\s*:?\s*(.*)$", raw, flags=re.IGNORECASE)
+    if not owner_match:
+        return {"type": "unknown"}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*done", lowered)
-    if m:
-        return {"type": "done_today", "owner": VALID_OWNERS[m.group(1)]}
+    owner_token = owner_match.group(1).lower()
+    owner = VALID_OWNERS.get(owner_token)
+    remainder_raw = normalize_spaces(owner_match.group(2))
+    remainder_lower = remainder_raw.lower()
+    tokens = remainder_lower.split()
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*clear\s+daily", lowered)
-    if m:
-        return {"type": "clear_daily", "owner": VALID_OWNERS[m.group(1)]}
+    if not owner or not remainder_raw:
+        return {"type": "unknown"}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*x\s+(\d+)", lowered)
-    if m:
-        return {"type": "complete", "owner": VALID_OWNERS[m.group(1)], "task_id": int(m.group(2))}
+    # owner-level commands
+    if remainder_lower == "today":
+        return {"type": "today", "owner": owner}
 
-    m = re.fullmatch(r"(richard|r|nick|n)\s*:?\s*move\s+(\d+)\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)", lowered)
-    if m:
+    if remainder_lower == "next":
+        return {"type": "owner_next", "owner": owner}
+
+    if remainder_lower == "done":
+        return {"type": "done_today", "owner": owner}
+
+    if remainder_lower == "clear daily":
+        return {"type": "clear_daily", "owner": owner}
+
+    # complete
+    if len(tokens) >= 2 and tokens[0] == "x" and tokens[1].isdigit():
+        return {"type": "complete", "owner": owner, "task_id": int(tokens[1])}
+
+    # move
+    if len(tokens) >= 3 and tokens[0] == "move" and tokens[1].isdigit():
+        category = VALID_CATEGORIES.get(tokens[2])
+        if category:
+            return {
+                "type": "move",
+                "owner": owner,
+                "task_id": int(tokens[1]),
+                "category": category,
+            }
+
+    # update shortcuts
+    # n u something
+    # n update something
+    if len(tokens) >= 2 and tokens[0] in {"u", "update", "updates"}:
+        task_text = normalize_spaces(remainder_raw.split(" ", 1)[1])
         return {
-            "type": "move",
-            "owner": VALID_OWNERS[m.group(1)],
-            "task_id": int(m.group(2)),
-            "category": VALID_CATEGORIES[m.group(3)],
+            "type": "add",
+            "owner": owner,
+            "category": "update",
+            "priority": False,
+            "task_text": task_text,
         }
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*u\s+(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s*u\s+", re.IGNORECASE)
-        task_text = prefix_pattern.sub("", raw, count=1).strip()
-        return {"type": "add", "owner": owner, "category": "update", "priority": False, "task_text": task_text}
+    # n + u something
+    # n + update something
+    if len(tokens) >= 3 and tokens[0] == "+" and tokens[1] in {"u", "update", "updates"}:
+        parts = remainder_raw.split(" ", 2)
+        if len(parts) >= 3:
+            task_text = normalize_spaces(parts[2])
+            return {
+                "type": "add",
+                "owner": owner,
+                "category": "update",
+                "priority": False,
+                "task_text": task_text,
+            }
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+!\s+(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        task_text = raw.split("!", 1)[1].strip()
-        return {"type": "add", "owner": owner, "category": "action", "priority": True, "task_text": task_text}
+    # high-priority action shortcuts
+    # n ! call plumber
+    if len(tokens) >= 2 and tokens[0] == "!":
+        task_text = normalize_spaces(remainder_raw[1:])
+        return {
+            "type": "add",
+            "owner": owner,
+            "category": "action",
+            "priority": True,
+            "task_text": task_text,
+        }
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*!\s+(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        task_text = raw.split("!", 1)[1].strip()
-        return {"type": "add", "owner": owner, "category": "action", "priority": True, "task_text": task_text}
+    # n + ! call plumber
+    if len(tokens) >= 3 and tokens[0] == "+" and tokens[1] == "!":
+        parts = remainder_raw.split(" ", 2)
+        if len(parts) >= 3:
+            task_text = normalize_spaces(parts[2])
+            return {
+                "type": "add",
+                "owner": owner,
+                "category": "action",
+                "priority": True,
+                "task_text": task_text,
+            }
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s*\+\s+(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        task_text = raw.split("+", 1)[1].strip()
-        return {"type": "add", "owner": owner, "category": "action", "priority": False, "task_text": task_text}
+    # category-based add
+    # n d check gmail
+    # n a call plumber
+    # n lt review pricing
+    # n u update note
+    if len(tokens) >= 2 and tokens[0] in VALID_CATEGORIES:
+        category = VALID_CATEGORIES[tokens[0]]
+        priority = False
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)\s+(!)?\s*(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        category = VALID_CATEGORIES[m.group(2)]
-        priority = bool(m.group(3)) and category == "action"
-        prefix_pattern = re.compile(r"^(richard|r|nick|n|rn)\s*:?\s+(daily|d|action|a|lt|l|long_term|longterm|u|update|updates)\s+", re.IGNORECASE)
-        task_text = prefix_pattern.sub("", raw, count=1).strip()
+        if category == "action" and len(tokens) >= 3 and tokens[1] == "!":
+            priority = True
+            parts = remainder_raw.split(" ", 2)
+            if len(parts) >= 3:
+                task_text = normalize_spaces(parts[2])
+            else:
+                task_text = ""
+        else:
+            task_text = normalize_spaces(remainder_raw.split(" ", 1)[1])
 
-        if priority and task_text.startswith("!"):
-            task_text = task_text[1:].strip()
+        return {
+            "type": "add",
+            "owner": owner,
+            "category": category,
+            "priority": priority,
+            "task_text": task_text,
+        }
 
-        return {"type": "add", "owner": owner, "category": category, "priority": priority, "task_text": task_text}
+    # plus means action item
+    # n + call plumber
+    if len(tokens) >= 2 and tokens[0] == "+":
+        task_text = normalize_spaces(remainder_raw.split(" ", 1)[1])
+        return {
+            "type": "add",
+            "owner": owner,
+            "category": "action",
+            "priority": False,
+            "task_text": task_text,
+        }
 
-    m = re.fullmatch(r"(richard|r|nick|n|rn)\s*:\s*(.+)", lowered)
-    if m:
-        owner = VALID_OWNERS[m.group(1)]
-        task_text = raw.split(":", 1)[1].strip()
-        return {"type": "legacy_add", "owner": owner, "category": "action", "priority": False, "task_text": task_text}
-
-    return {"type": "unknown"}
+    # implicit natural add
+    # n call plumber
+    return {
+        "type": "add",
+        "owner": owner,
+        "category": "action",
+        "priority": False,
+        "task_text": remainder_raw,
+    }
 
 
 # -------------------------
@@ -679,15 +781,14 @@ async def sms_reply(request: Request):
             r2 = add_task("nick", command["category"], command["task_text"], command["priority"])
             return twiml(f"{r1}\n\n{r2}")
 
-        return twiml(add_task(command["owner"], command["category"], command["task_text"], command["priority"]))
-
-    if command["type"] == "legacy_add":
-        if command["owner"] == "both":
-            r1 = add_task("richard", "action", command["task_text"], False)
-            r2 = add_task("nick", "action", command["task_text"], False)
-            return twiml(f"{r1}\n\n{r2}")
-
-        return twiml(add_task(command["owner"], "action", command["task_text"], False))
+        return twiml(
+            add_task(
+                command["owner"],
+                command["category"],
+                command["task_text"],
+                command["priority"],
+            )
+        )
 
     return twiml("Command not recognized. Text HELP for command list.")
 
@@ -707,11 +808,18 @@ def complete_task_web(task_id: int):
 
     if (task.get("category") or "action") == "daily":
         supabase.table("tasks").update(
-            {"last_completed_date": str(today_utc()), "completed_at": now_utc_iso(), "status": "open"}
+            {
+                "last_completed_date": str(today_utc()),
+                "completed_at": now_utc_iso(),
+                "status": "open",
+            }
         ).eq("id", task_id).execute()
     else:
         supabase.table("tasks").update(
-            {"status": "completed", "completed_at": now_utc_iso()}
+            {
+                "status": "completed",
+                "completed_at": now_utc_iso(),
+            }
         ).eq("id", task_id).execute()
 
     return JSONResponse({"success": True})
@@ -741,12 +849,20 @@ def render_section(title: str, tasks: list, include_age: bool = False) -> str:
         elif is_overdue(task):
             prefix = '<span class="warn">⚠</span>'
 
-        age = f' <span class="age">· {task_age_days(task)}d old</span>' if include_age and task_age_days(task) > 0 else ""
+        age = ""
+        if include_age and task_age_days(task) > 0:
+            age = f' <span class="age">· {task_age_days(task)}d old</span>'
+
+        time_part = ""
+        if task.get("category") == "update":
+            ts = format_time_short(task.get("created_at"))
+            if ts:
+                time_part = f' <span class="age">— {esc(ts)}</span>'
 
         html_out += f'''
         <label class="task-row">
             <input type="checkbox" onclick="completeTask({task['id']})">
-            <span class="task-text">{prefix}{esc(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span>{age}</span>
+            <span class="task-text">{prefix}{esc(task['task'])} <span class="task-id">[Task ID: {task['id']}]</span>{time_part}{age}</span>
         </label>
         '''
 
@@ -881,7 +997,7 @@ def base_page(title: str, content: str) -> str:
             }}
             .stats-grid {{
                 display: grid;
-                grid-template-columns: repeat(4, 1fr);
+                grid-template-columns: repeat(5, 1fr);
                 gap: 18px;
                 margin-bottom: 24px;
             }}
@@ -903,7 +1019,7 @@ def base_page(title: str, content: str) -> str:
                 color: #666;
                 font-style: italic;
             }}
-            @media (max-width: 1100px) {{
+            @media (max-width: 1200px) {{
                 .stats-grid {{
                     grid-template-columns: 1fr 1fr;
                 }}
